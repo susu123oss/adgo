@@ -1,0 +1,11 @@
+Package: com.ios.splashaway
+Name: 开屏广告走开
+Depends: mobilesubstrate
+Conflicts: com.ios.adskip
+Replaces: com.ios.adskip
+Version: 0.0.3
+Architecture: iphoneos-arm64
+Description: 基于视图层级智能扫描与端侧 Vision OCR 的开屏广告自动跳过插件
+Maintainer: Developer
+Author: Developer
+Section: Tweaks
