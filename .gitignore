@@ -2,6 +2,7 @@
 packages/
 dist/
 *.deb
+release/*.zip
 王跳跳_*.dylib
 .mt-analysis/
 .DS_Store
