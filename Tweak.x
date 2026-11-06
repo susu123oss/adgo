@@ -7,6 +7,25 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
+/*
+ * 开屏广告走开的核心实现说明
+ *
+ * 这个文件运行在被注入应用自己的进程中，因此所有工作都必须在主线程
+ * 上安全地观察和操作 UIKit 对象。整体流程按“先便宜、后昂贵”的顺序
+ * 执行：先扫描原生控件，再尝试用户录制的坐标，然后才进行 OCR，最后
+ * 才使用右上角兜底。这样可以减少截图和视图树遍历对宿主应用的影响。
+ *
+ * 插件自己的设置面板、提示和坐标标记全部放在独立的 HUD 窗口中。HUD
+ * 会被扫描逻辑主动排除，避免插件自己的文字被误识别成“跳过”按钮；
+ * 同时 HUD 的根视图默认不拦截触摸，只有面板和录制遮罩中的控件会接收
+ * 事件。
+ *
+ * 用户录制的点会同时保存屏幕坐标和可用的控件特征。能识别出文字或
+ * 控件类型时，后台监听只会在特征匹配后点击，避免固定坐标误触宿主
+ * 应用的其他按钮；无法识别特征的旧坐标则只保留启动阶段的一次尝试。
+ */
+
+// 视图树扫描和弹窗扫描都设置节点预算，防止复杂应用的层级过深导致卡顿。
 static const NSInteger kASOwnViewTag = 0x0A5C1F;
 static const NSTimeInterval kASTickInterval = 0.25;
 static const NSTimeInterval kASSessionDuration = 6.0;
@@ -38,6 +57,7 @@ static const NSTimeInterval kASPointWatchInterval = 1.0;
 static const NSTimeInterval kASPointCooldown = 4.0;
 static NSString *const kASVersion = @"0.0.3";
 
+// 统一的强调色用于点击反馈、录制标记和自定义设置面板。
 static UIColor *ASAccentColor(void) {
     return [UIColor colorWithRed:0.25 green:0.90 blue:0.62 alpha:1.0];
 }
@@ -45,6 +65,8 @@ static UIColor *ASAccentColor(void) {
 #pragma mark - 运行范围
 
 static BOOL ASShouldRunInProcess(void) {
+    // 不处理系统应用、扩展或没有正常 App bundle 的进程，降低注入范围
+    // 和宿主应用启动阶段发生冲突的概率。
     NSBundle *mainBundle = [NSBundle mainBundle];
     NSString *bundleId = mainBundle.bundleIdentifier;
     if (bundleId.length == 0) return NO;
@@ -56,6 +78,8 @@ static BOOL ASShouldRunInProcess(void) {
 #pragma mark - 文本归一化与判定
 
 static NSString *ASNormalizeText(NSString *raw) {
+    // 广告按钮经常包含倒计时、空格或装饰符号。先归一化，再交给后续
+    // 的严格/宽松规则判断，可以减少同一按钮的规则重复。
     if (raw.length == 0 || raw.length > 20) return nil;
     static NSRegularExpression *countdownRegex;
     static NSCharacterSet *stripSet;
@@ -73,6 +97,8 @@ static NSString *ASNormalizeText(NSString *raw) {
 }
 
 static BOOL ASIsSkipText(NSString *raw, BOOL strict) {
+    // strict 用于被动监听：只接受明确的“跳过广告”语义；
+    // 启动阶段可以在不严格模式下接受单独的“关闭”或关闭图标。
     NSString *text = ASNormalizeText(raw);
     if (text.length == 0 || text.length > 8) return NO;
 
@@ -109,6 +135,8 @@ typedef NS_ENUM(NSInteger, ASDismissLevel) {
 };
 
 static ASDismissLevel ASDismissLevelForText(NSString *raw) {
+    // 弹窗按钮按“明确拒绝打扰”“可能关闭”“不可自动处理”分级。
+    // 只有前两类在安全条件满足时才会被自动触发。
     NSString *text = ASNormalizeText(raw);
     if (text.length == 0 || text.length > 10) return ASDismissNone;
 
@@ -161,6 +189,8 @@ static NSArray<NSString *> *ASRetentionPhrases(void) {
 }
 
 static BOOL ASPopupTextIsDangerous(NSString *text) {
+    // 只要弹窗上下文出现支付、删除、退出登录等高风险语义，就放弃
+    // 整个弹窗，宁可漏点也不替用户做不可逆操作。
     if (text.length > 0) {
         NSString *stripped = text;
         for (NSString *phrase in ASRetentionPhrases()) {
@@ -180,6 +210,7 @@ static BOOL ASPopupTextIsDangerous(NSString *text) {
 }
 
 static BOOL ASPopupTextIsNuisance(NSString *text) {
+    // 这些词用于判断普通关闭按钮是否属于打扰性弹窗，而不是业务页面。
     static NSArray<NSString *> *words;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
@@ -192,6 +223,8 @@ static BOOL ASPopupTextIsNuisance(NSString *text) {
 }
 
 static BOOL ASIsDimBackdropView(UIView *view) {
+    // 非系统 UIAlertController 的弹窗通常有一层覆盖全屏的半透明背景；
+    // 通过颜色和透明度特征寻找这层背景，再在其上方收集候选按钮。
     UIColor *color = view.backgroundColor;
     if (!color) return NO;
     CGFloat white = 1, alpha = 0;
@@ -205,6 +238,7 @@ static BOOL ASIsDimBackdropView(UIView *view) {
 }
 
 static BOOL ASViewIsTappable(UIView *view) {
+    // 录制控件特征时，优先把 UIControl 和带点击手势的视图当作可操作节点。
     if ([view isKindOfClass:[UIControl class]]) return ((UIControl *)view).isEnabled;
     for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
         if ([gesture isKindOfClass:[UITapGestureRecognizer class]] && gesture.isEnabled) return YES;
@@ -227,6 +261,8 @@ static BOOL ASLooksLikeCloseIcon(UIView *view, CGRect rect) {
 }
 
 static NSString *ASTextOfView(UIView *view) {
+    // 尽量从常见 UIKit 控件读取文字；对未知类只读取公开的 text/title
+    // 相关属性，避免强行调用宿主自定义对象的方法。
     NSString *text = nil;
     if ([view isKindOfClass:[UIButton class]]) {
         UIButton *button = (UIButton *)view;
@@ -251,6 +287,8 @@ static void ASCollectShortTexts(UIView *view, NSInteger depth, NSInteger *budget
 }
 
 static UIView *ASSignatureAnchorForHit(UIView *hit, UIWindow *window) {
+    // hitTest 返回的可能是文字标签或装饰子视图。向上最多找三层，
+    // 把一次点击归并到更稳定的按钮/容器节点上。
     CGSize windowSize = window.bounds.size;
     UIView *current = hit;
     UIView *anchor = hit;
@@ -265,6 +303,8 @@ static UIView *ASSignatureAnchorForHit(UIView *hit, UIWindow *window) {
 }
 
 static NSString *ASSignatureTextOfView(UIView *anchor, UIWindow *window) {
+    // 录制和回放使用同一套文字收集逻辑，避免“录制时能识别、回放时
+    // 识别不到”的不一致。
     if (!anchor) return @"";
     CGRect rect = [anchor convertRect:anchor.bounds toView:window];
     if (rect.size.width > window.bounds.size.width * 0.7 || rect.size.height > window.bounds.size.height * 0.2) return @"";
@@ -283,6 +323,8 @@ static BOOL ASIsGenericViewClass(UIView *view) {
 }
 
 static BOOL ASSignatureTextMatches(NSString *recorded, NSString *current) {
+    // 文案可能因为倒计时或前后缀变化而略有不同，因此允许包含关系，
+    // 但不接受过短的单字符特征。
     if (recorded.length == 0 || current.length == 0) return NO;
     if ([recorded isEqualToString:current]) return YES;
     if (recorded.length < 2 || current.length < 2) return NO;
@@ -307,6 +349,8 @@ static BOOL ASIsSystemInputWindow(UIWindow *window) {
 @end
 
 static NSArray<UIWindow *> *ASVisibleWindows(void) {
+    // iOS 13 以后窗口属于 UIWindowScene；为了兼容旧宿主和部分注入场景，
+    // 先枚举前台 scene，枚举不到时再回退到 UIApplication.windows。
     UIApplication *app = [UIApplication sharedApplication];
     NSMutableArray<UIWindow *> *all = [NSMutableArray array];
     for (UIScene *scene in app.connectedScenes) {
@@ -348,16 +392,20 @@ static id<UICoordinateSpace> ASScreenSpaceForView(UIView *view) {
 }
 
 static CGPoint ASScreenPointFromView(UIView *view, CGPoint point) {
+    // 所有持久化坐标统一保存为屏幕坐标，不保存某个窗口或子视图的局部坐标。
+    // 这样可以跨越窗口层级变化，并避免 HUD 窗口导致坐标落到左上角。
     if (!view) return point;
     return [view convertPoint:point toCoordinateSpace:ASScreenSpaceForView(view)];
 }
 
 static CGPoint ASViewPointFromScreen(UIView *view, CGPoint screenPoint) {
+    // 点击宿主视图前，把持久化的屏幕坐标转换回目标窗口坐标。
     if (!view) return screenPoint;
     return [view convertPoint:screenPoint fromCoordinateSpace:ASScreenSpaceForView(view)];
 }
 
 static BOOL ASIsUsableScreenPoint(CGPoint point) {
+    // 过滤未初始化的 (0,0)、NaN 和明显越界值，避免把坏坐标直接发送给宿主。
     if (!isfinite(point.x) || !isfinite(point.y)) return NO;
     if (point.x < 1.0 && point.y < 1.0) return NO;
     CGRect bounds = [UIScreen mainScreen].bounds;
@@ -370,6 +418,8 @@ static BOOL ASIsUsableScreenPoint(CGPoint point) {
 @implementation SplashAwayHUDWindow
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // HUD 只显示反馈时不能挡住宿主触摸；只有真正命中的面板、按钮或
+    // 录制遮罩子视图才允许接收事件。
     UIView *hit = [super hitTest:point withEvent:event];
     if (hit == self || hit == self.rootViewController.view) return nil;
     return hit;
@@ -384,6 +434,8 @@ static BOOL ASIsUsableScreenPoint(CGPoint point) {
 @implementation SplashAwayHUDRootView
 
 - (void)didAddSubview:(UIView *)subview {
+    // 根视图有内容时显示 HUD 窗口；所有反馈移除后再隐藏窗口，减少
+    // 对宿主窗口枚举和后续扫描的干扰。
     [super didAddSubview:subview];
     self.window.hidden = NO;
 }
@@ -400,6 +452,8 @@ static BOOL ASIsUsableScreenPoint(CGPoint point) {
 @end
 
 static UIViewController *ASStatusBarSource(UIWindow *host, BOOL forHidden) {
+    // HUD 复制宿主顶部控制器的状态栏和旋转策略，避免弹出设置时出现
+    // 状态栏样式或横竖屏方向突然变化。
     UIViewController *controller = host ? ASTopViewController(host) : nil;
     for (NSInteger depth = 0; depth < 8 && controller; depth++) {
         UIViewController *child = forHidden ? controller.childViewControllerForStatusBarHidden : controller.childViewControllerForStatusBarStyle;
@@ -442,6 +496,8 @@ static UIViewController *ASStatusBarSource(UIWindow *host, BOOL forHidden) {
 #pragma mark - 手势目标直接派发
 
 static BOOL ASFireTapGesture(UIGestureRecognizer *gesture) {
+    // 有些广告按钮只挂了 UITapGestureRecognizer，没有 UIControl action。
+    // 这里读取手势内部 target/action 直接派发，失败时仍会回退到合成触摸。
     BOOL fired = NO;
     @try {
         Ivar targetsIvar = class_getInstanceVariable([UIGestureRecognizer class], "_targets");
@@ -481,6 +537,8 @@ static const uint32_t kASHIDEventMaskRangeTouch = 0x3;
 static const uint32_t kASHIDFieldDisplayIntegrated = (11 << 16) | 25;
 
 static ASHIDEventRef ASCreateHIDEvent(CGPoint point, BOOL touching) {
+    // 通过运行时查找 IOHIDEvent 符号，避免在编译期增加固定私有库依赖。
+    // 符号不可用时调用方会自动回退到 UITouch/touchesBegan 路径。
     static ASHIDCreateDigitizerFn createHand;
     static ASHIDCreateFingerFn createFinger;
     static ASHIDAppendFn appendEvent;
@@ -517,6 +575,8 @@ static void ASSendBool(id target, NSString *selectorName, BOOL value) {
 }
 
 static UITouch *ASMakeTouch(UIWindow *window, UIView *view, CGPoint point) {
+    // 构造一次最小的 UITouch 生命周期：窗口、目标视图、位置、按下阶段
+    // 和点击标记。所有私有 selector 都先检查是否可用。
     SEL setWindowSel = NSSelectorFromString(@"setWindow:");
     SEL setViewSel = NSSelectorFromString(@"setView:");
     SEL setLocationSel = NSSelectorFromString(@"_setLocationInWindow:resetPrevious:");
@@ -549,6 +609,8 @@ static UITouch *ASMakeTouch(UIWindow *window, UIView *view, CGPoint point) {
 }
 
 static BOOL ASSendTouchEvent(UITouch *touch, ASHIDEventRef hidEvent) {
+    // 优先把触摸交给 UIApplication 的事件分发链，让 WebView、游戏引擎
+    // 等不响应普通 sendActions 的目标也有机会收到点击。
     UIApplication *app = [UIApplication sharedApplication];
     SEL touchesEventSel = NSSelectorFromString(@"_touchesEvent");
     SEL clearSel = NSSelectorFromString(@"_clearTouches");
@@ -569,6 +631,8 @@ static BOOL ASSendTouchEvent(UITouch *touch, ASHIDEventRef hidEvent) {
 }
 
 static BOOL ASDispatchTouch(UITouch *touch, UIView *view, CGPoint point, UITouchPhase phase, BOOL *viaEvent) {
+    // 先尝试系统事件链；事件链不可用或抛异常时，只对目标视图直接发送
+    // touchesBegan/touchesEnded，保证失败不会把异常传播到宿主。
     BOOL ended = (phase == UITouchPhaseEnded);
     @try {
         if (ended) {
@@ -611,6 +675,8 @@ static BOOL ASDispatchTouch(UITouch *touch, UIView *view, CGPoint point, UITouch
 }
 
 static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
+    // 合成点击必须拆成“按下”和“抬起”两个阶段，并留出一个很短的
+    // 主线程间隔，模拟真实触摸的时序。
     UITouch *touch = nil;
     @try {
         touch = ASMakeTouch(window, view, point);
@@ -630,6 +696,7 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 #pragma mark - 引擎
 
 @interface SplashAwayEngine : NSObject <UIGestureRecognizerDelegate>
+// 会话状态：启动/回前台后只在有限时长内进行高频扫描。
 @property (nonatomic, assign) BOOL isMonitoring;
 @property (nonatomic, assign) BOOL hasTriggered;
 @property (nonatomic, assign) BOOL ocrInFlight;
@@ -640,12 +707,14 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 @property (nonatomic, assign) CFAbsoluteTime lastActivation;
 @property (nonatomic, assign) CFAbsoluteTime lastOCR;
 @property (nonatomic, strong) dispatch_source_t scanTimer;
+// 自定义坐标和对应控件特征按相同下标配对保存。
 @property (nonatomic, strong) NSMutableArray<NSValue *> *customPoints;
 @property (nonatomic, strong) NSMutableArray<NSDictionary *> *customSignatures;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pointLastTap;
 @property (nonatomic, strong) NSHashTable<UIView *> *pointTappedViews;
 @property (nonatomic, strong) dispatch_source_t pointTimer;
 @property (nonatomic, strong) NSHashTable<UIView *> *failedViews;
+// 下面这些视图属于插件自己的 UI 或已处理对象，扫描时必须跳过。
 @property (nonatomic, strong) UIView *pickOverlay;
 @property (nonatomic, strong) UIView *markerView;
 @property (nonatomic, strong) SplashAwayHUDWindow *hud;
@@ -688,6 +757,8 @@ static BOOL gASWatchActive = NO;
 - (instancetype)init {
     self = [super init];
     if (self) {
+        // 这是单例引擎的唯一初始化位置；坐标、弱引用表和用户设置都在
+        // 主流程开始前准备好，避免首次触发时边扫描边创建状态。
         _customPoints = [NSMutableArray array];
         _customSignatures = [NSMutableArray array];
         _pointLastTap = [NSMutableDictionary dictionary];
@@ -702,6 +773,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)refreshCachedSettings {
+    // 高频路径读取缓存字段而不是每个 tick 都反复访问 NSUserDefaults；
+    // 设置面板修改开关后会再次调用这里立即生效。
     self.enabledOn = [self boolForKey:kASEnabledDefaultsKey];
     self.popupOn = [self boolForKey:kASPopupDefaultsKey];
     self.watchOn = [self boolForKey:kASWatchDefaultsKey];
@@ -712,12 +785,16 @@ static BOOL gASWatchActive = NO;
 #pragma mark 坐标持久化
 
 - (NSString *)legacyCustomPointsFilePath {
+    // 早期版本把坐标放在 Caches/AdSkip 下。这里仅用于一次性迁移，
+    // 新数据统一写入 NSUserDefaults，避免系统清理缓存导致配置丢失。
     NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSString *cacheDir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
     return [[cacheDir stringByAppendingPathComponent:@"AdSkip"] stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.plist", bundleId]];
 }
 
 - (void)loadCustomPoints {
+    // 兼容两种存储格式：旧版本的 CGPoint 字符串，以及带 point/签名
+    // 字段的新字典。读取时同时过滤非法坐标，防止历史坏数据再次触发。
     [self.customPoints removeAllObjects];
     [self.customSignatures removeAllObjects];
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -752,6 +829,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)persistCustomPoints {
+    // 坐标和签名必须保持下标对齐；没有可靠签名的点只存字符串，
+    // 让旧坐标继续作为启动阶段的盲点使用。
     NSMutableArray *rawPoints = [NSMutableArray array];
     [self.customPoints enumerateObjectsUsingBlock:^(NSValue *value, NSUInteger index, BOOL *stop) {
         NSString *pointString = NSStringFromCGPoint(value.CGPointValue);
@@ -788,6 +867,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (NSDictionary *)signatureAtScreenPoint:(CGPoint)screenPoint {
+    // 录制时从当前命中的宿主视图提取稳定特征：类名、尺寸和短文本。
+    // 这些信息只用于确认“这里还是同一个按钮”，不会改变宿主视图。
     for (UIWindow *window in ASVisibleWindows()) {
         CGPoint point = ASViewPointFromScreen(window, screenPoint);
         if (!CGRectContainsPoint(window.bounds, point)) continue;
@@ -807,6 +888,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)updatePointWatcher {
+    // 只有至少一个坐标带有可靠签名时才启动定时器。纯坐标点不在全程
+    // 监听中重复点击，避免误触普通页面控件。
     BOOL want = self.enabledOn && [self hasSignedPoints];
     if (want && !self.pointTimer) {
         self.pointTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -826,6 +909,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (BOOL)view:(UIView *)anchor inWindow:(UIWindow *)window matchesSignature:(NSDictionary *)signature {
+    // 文本签名优先级高于类名和尺寸；没有文本时才要求类名一致，
+    // 并允许尺寸有小幅变化以适应不同字体和布局。
     NSString *recordedText = [signature[@"text"] isKindOfClass:[NSString class]] ? signature[@"text"] : @"";
     if (recordedText.length > 0) {
         return ASSignatureTextMatches(recordedText, ASSignatureTextOfView(anchor, window));
@@ -843,6 +928,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)watchSignedPoints {
+    // 全程监听每秒检查一次录制点，但必须同时满足：应用活跃、面板未打开、
+    // 冷却已结束、当前位置命中的控件特征一致。
     if (!self.enabledOn || self.pickOverlay || self.panelView) return;
     UIApplication *app = [UIApplication sharedApplication];
     if (!app || app.applicationState != UIApplicationStateActive) return;
@@ -879,6 +966,7 @@ static BOOL gASWatchActive = NO;
 #pragma mark 会话调度
 
 - (void)markActivationAndStart {
+    // 启动和回前台都重置一次短时会话，同时把设置手势装到当前可见窗口。
     self.lastActivation = CFAbsoluteTimeGetCurrent();
     for (UIWindow *window in ASVisibleWindows()) {
         [self installSettingsGestureOnWindow:window];
@@ -887,6 +975,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)handleWindowBecameVisible:(UIWindow *)window {
+    // 新窗口通常意味着页面、广告或弹窗出现。先登记被动监听，再决定
+    // 是否启动一次短时高频会话。
     if ([window isKindOfClass:[SplashAwayHUDWindow class]]) return;
     [self installSettingsGestureOnWindow:window];
     if (!ASIsSystemInputWindow(window)) [self noteUIChange:window fresh:YES];
@@ -896,6 +986,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)startSession {
+    // 每次会话都清空本轮的“已尝试”状态；计时器运行在主队列，保证
+    // UIKit 视图遍历、点击和 UI 更新不会跨线程执行。
     [self stopSession];
     if (![self boolForKey:kASEnabledDefaultsKey]) return;
     self.hasTriggered = NO;
@@ -921,6 +1013,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)stopSession {
+    // dispatch source 取消后立即置空，下一次会话可以安全创建新的 timer。
     self.isMonitoring = NO;
     if (self.scanTimer) {
         dispatch_source_cancel(self.scanTimer);
@@ -929,6 +1022,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)tick {
+    // 扫描优先级：原生“跳过”按钮 -> 弹窗清理 -> 盲点坐标 ->
+    // Vision OCR -> 右上角兜底。任一阶段成功都会结束本轮。
     if (!self.isMonitoring) return;
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
 
@@ -972,6 +1067,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 第四级：右上角兜底
 
 - (void)tapTopRightCornerInWindow:(UIWindow *)window {
+    // 右上角是最后手段，只在前面所有识别都耗尽后执行；命中导航栏、
+    // 标签栏、工具栏或搜索栏时直接放弃，减少无广告页面误点。
     if (!window) return;
     UIEdgeInsets insets = window.safeAreaInsets;
     CGPoint point = CGPointMake(window.bounds.size.width - 30.0 - insets.right, insets.top + 30.0);
@@ -990,6 +1087,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 第一级：视图树扫描
 
 - (BOOL)scanNativeHierarchyInWindows:(NSArray<UIWindow *> *)windows {
+    // 原生视图扫描成本最低，且能拿到 UIControl/手势对象，因此始终
+    // 放在会话流程第一步。
     for (UIWindow *window in windows) {
         NSInteger budget = kASScanNodeBudget;
         UIView *candidate = [self findSkipViewIn:window window:window depth:0 budget:&budget strict:NO];
@@ -1008,6 +1107,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (UIView *)findSkipViewIn:(UIView *)view window:(UIWindow *)window depth:(NSInteger)depth budget:(NSInteger *)budget strict:(BOOL)strict {
+    // 深度和节点预算是双重保护：既防止异常层级递归，也防止大型
+    // WebView/游戏场景在单次扫描中占用过多主线程时间。
     if (!view || depth > 30 || *budget <= 0) return nil;
     (*budget)--;
     if (view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) return nil;
@@ -1038,6 +1139,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 弹窗清理
 
 - (BOOL)dismissPopupsInWindows:(NSArray<UIWindow *> *)windows {
+    // 先处理系统 UIAlertController，再处理自绘遮罩弹窗；两类弹窗
+    // 共用冷却时间，避免连续动画期间重复点击。
     if (CFAbsoluteTimeGetCurrent() - self.lastPopupAction < kASPopupCooldown) return NO;
     for (UIWindow *window in windows) {
         BOOL hasAlert = NO;
@@ -1049,6 +1152,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (BOOL)dismissAlertInWindow:(UIWindow *)window hasAlert:(BOOL *)hasAlert {
+    // 系统弹窗只处理普通 Alert，不处理带输入框的弹窗或破坏性 action。
+    // action handler 会在 dismiss 完成后调用，尽量保留 UIKit 原本的语义。
     UIViewController *controller = window.rootViewController;
     while (controller && ![controller isKindOfClass:[UIAlertController class]]) {
         UIViewController *next = controller.presentedViewController;
@@ -1103,6 +1208,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (UIView *)findBackdropIn:(UIView *)view window:(UIWindow *)window depth:(NSInteger)depth budget:(NSInteger *)budget {
+    // 自绘弹窗没有统一类型，只能通过近似全屏的半透明背景寻找候选根节点。
     if (!view || depth > 14 || *budget <= 0) return nil;
     (*budget)--;
     if (view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) return nil;
@@ -1119,6 +1225,8 @@ static BOOL gASWatchActive = NO;
 
 - (void)collectPopupItemsIn:(UIView *)view window:(UIWindow *)window depth:(NSInteger)depth budget:(NSInteger *)budget
                       texts:(NSMutableString *)texts candidates:(NSMutableArray<UIView *> *)candidates {
+    // 收集弹窗文案和尺寸合适的候选控件；预算与深度限制避免把整个
+    // 宿主页面当作弹窗递归扫描。
     if (!view || depth > 25 || *budget <= 0) return;
     (*budget)--;
     if (view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) return;
@@ -1140,6 +1248,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (BOOL)dismissOverlayPopupInWindow:(UIWindow *)window {
+    // 自绘弹窗按“危险词拒绝、打扰词确认、按钮尺寸过滤”的顺序
+    // 选择最保守的可点击候选，找不到安全候选时不做任何动作。
     NSInteger budget = kASPopupNodeBudget;
     UIView *backdrop = [self findBackdropIn:window window:window depth:0 budget:&budget];
     if (!backdrop || [self.handledPopups containsObject:backdrop]) return NO;
@@ -1195,6 +1305,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)didDismissPopupAtPoint:(CGPoint)point inWindow:(UIWindow *)window {
+    // 记录弹窗统计并显示点击反馈；监听模式下稍后重新扫描，以处理
+    // “一个弹窗关闭后又露出下一个弹窗”的连续场景。
     self.lastPopupAction = CFAbsoluteTimeGetCurrent();
     [self recordPopupWithMethod:@"弹窗清理"];
     [self showTapFeedbackAtPoint:point inWindow:window];
@@ -1209,6 +1321,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 全程监听
 
 - (void)noteUIChange:(UIView *)root fresh:(BOOL)fresh {
+    // 多个 UIKit 回调可能在很短时间内连续触发，这里只安排一个延迟
+    // 扫描，把一批界面变化合并处理，避免每个 addSubview 都完整遍历。
     if (!self.enabledOn || !self.watchOn) return;
     if (root && fresh) [self.freshRoots addObject:root];
     if (self.passiveScanPending) return;
@@ -1222,6 +1336,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)passiveScan {
+    // 被动扫描只检查新出现且接近全屏的根视图，并使用 strict 规则；
+    // 普通页面中的“关闭”不会被当成广告跳过按钮。
     self.passiveScanPending = NO;
     if (!self.enabledOn || !self.watchOn) return;
     if (self.isMonitoring || self.pickOverlay || self.panelView) {
@@ -1266,6 +1382,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 点击派发
 
 - (BOOL)activateView:(UIView *)view inWindow:(UIWindow *)window {
+    // 点击优先级：可用 UIControl action -> UITapGestureRecognizer；
+    // 两者都没有时由调用方继续尝试屏幕坐标和合成触摸。
     CGSize windowSize = window.bounds.size;
     UIView *current = view;
     for (NSInteger level = 0; level < 4 && current && current != window; level++) {
@@ -1287,6 +1405,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (BOOL)activateScreenPoint:(CGPoint)screenPoint {
+    // 屏幕坐标点击会重新命中当前最上层窗口，避免使用录制时已经失效
+    // 的 UIView 指针；命中插件 HUD 时主动跳过。
     for (UIWindow *window in ASVisibleWindows()) {
         CGPoint point = ASViewPointFromScreen(window, screenPoint);
         if (!CGRectContainsPoint(window.bounds, point)) continue;
@@ -1301,6 +1421,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 第二级：录制坐标
 
 - (void)tapCustomPoints {
+    // 无签名坐标只在启动会话中按录制顺序尝试一次，并在点之间留出
+    // 间隔，给广告页面完成转场和布局的时间。
     NSArray<NSValue *> *points = [self blindPoints];
     self.hasTriggered = YES;
     [self stopSession];
@@ -1325,6 +1447,9 @@ static BOOL gASWatchActive = NO;
 #pragma mark 第三级：Vision OCR
 
 - (void)runOCROnWindow:(UIWindow *)window {
+    // 截图对象 snapshot 必须被后台 block 强引用到 Vision 完成，不能只
+    // 保存 CGImage 指针，否则主线程返回后图像释放会造成随机崩溃。
+    // OCR 结果回到主线程后还要重新确认会话仍有效，再执行点击。
     if (!window) return;
     self.ocrInFlight = YES;
     self.ocrRuns++;
@@ -1382,6 +1507,7 @@ static BOOL gASWatchActive = NO;
 #pragma mark 偏好与统计
 
 - (BOOL)boolForKey:(NSString *)key {
+    // 新安装默认开启所有功能；只有用户明确写入 NO 时才关闭。
     id value = [[NSUserDefaults standardUserDefaults] objectForKey:key];
     return value ? [value boolValue] : YES;
 }
@@ -1395,6 +1521,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)recordSkipWithMethod:(NSString *)method {
+    // 跳过次数和最近方式按宿主应用自己的 NSUserDefaults 隔离保存。
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setInteger:[defaults integerForKey:kASSkipCountDefaultsKey] + 1 forKey:kASSkipCountDefaultsKey];
     [defaults setObject:method ?: @"" forKey:kASLastMethodDefaultsKey];
@@ -1402,6 +1529,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)recordPopupWithMethod:(NSString *)method {
+    // 弹窗统计与开屏广告统计分开计数，但共用最近一次操作说明。
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     [defaults setInteger:[defaults integerForKey:kASPopupCountDefaultsKey] + 1 forKey:kASPopupCountDefaultsKey];
     [defaults setObject:method ?: @"" forKey:kASLastMethodDefaultsKey];
@@ -1409,6 +1537,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (NSString *)lastSkipDescription {
+    // 面板只显示相对时间，避免暴露宿主应用的具体时间信息；
+    // 没有记录时使用明确的空状态文案。
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSDate *date = [defaults objectForKey:kASLastDateDefaultsKey];
     NSString *method = [defaults stringForKey:kASLastMethodDefaultsKey];
@@ -1446,6 +1576,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (SplashAwayHUDWindow *)hudForWindow:(UIWindow *)window {
+    // 每个宿主 scene 只维护一个 HUD。宿主 scene 变化时重建，避免把
+    // 一个 scene 的 UIView 挂到另一个 scene，导致布局和坐标转换异常。
     UIWindow *host = [self resolveHostWindow:window];
     UIWindowScene *scene = host.windowScene ?: [self activeScene];
     if (!self.hud || (scene && self.hud.windowScene != scene)) {
@@ -1478,6 +1610,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 反馈
 
 - (void)finishWithFeedbackAtPoint:(CGPoint)point inWindow:(UIWindow *)window method:(NSString *)method {
+    // 所有成功路径最终都汇聚到这里，统一停止当前会话、写入统计并显示
+    // 点击反馈，避免不同识别方式产生不一致的状态。
     self.hasTriggered = YES;
     [self stopSession];
     [self recordSkipWithMethod:method];
@@ -1530,6 +1664,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (UIView *)makePillWithTitle:(NSString *)title detail:(NSString *)detail symbol:(NSString *)symbol inWindow:(UIWindow *)window {
+    // 胶囊提示属于非阻塞反馈，不改变宿主窗口的触摸链；只有启动提示
+    // 会在创建后额外添加点击手势作为设置入口。
     if (!window) return nil;
     [self dismissPill:self.toastView];
     UIView *root = [self hudRootForWindow:window];
@@ -1628,6 +1764,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 坐标标记
 
 - (UIView *)makeMarkersViewWithFrame:(CGRect)frame {
+    // 坐标标记使用屏幕坐标转换到 HUD 局部坐标，不能直接把宿主窗口
+    // 的 bounds 当作 HUD 坐标，否则在安全区或旋转后会发生偏移。
     UIView *container = [[UIView alloc] initWithFrame:frame];
     container.userInteractionEnabled = NO;
     container.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -1659,6 +1797,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)showPointMarkersInWindow:(UIWindow *)window duration:(NSTimeInterval)duration completion:(void (^)(void))completion {
+    // “查看”只显示短暂的只读标记；标记视图不接收触摸，避免用户
+    // 误以为查看状态会改变坐标。
     [self.markerView removeFromSuperview];
     self.markerView = nil;
     if (!window || self.customPoints.count == 0 || duration <= 0) {
@@ -1695,12 +1835,16 @@ static BOOL gASWatchActive = NO;
 #pragma mark 设置入口：启动提示与三指长按
 
 - (void)refreshSettingsGestures {
+    // 新窗口出现后可能没有安装三指手势，因此每次刷新都重新枚举可见窗口；
+    // 具体窗口通过关联对象保证不会重复添加识别器。
     for (UIWindow *window in ASVisibleWindows()) {
         [self installSettingsGestureOnWindow:window];
     }
 }
 
 - (void)scheduleLaunchToastAttempt:(NSInteger)attempt {
+    // 宿主刚启动时窗口可能尚未完成创建，最多重试几次再显示启动入口，
+    // 不用固定延时强行访问尚未准备好的窗口。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive || ASVisibleWindows().count == 0) {
             if (attempt < 4) [self scheduleLaunchToastAttempt:attempt + 1];
@@ -1711,6 +1855,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)showLaunchToast {
+    // 启动提示既是状态反馈，也是关闭三指手势后的备用入口；
+    // 因此只有用户明确关闭启动提示时才不显示。
     if (![self boolForKey:kASLaunchToastDefaultsKey] || self.panelView || self.pickOverlay) return;
     BOOL enabled = [self boolForKey:kASEnabledDefaultsKey];
     NSString *title = enabled ? @"开屏广告走开 · 已就绪" : @"开屏广告走开 · 已暂停";
@@ -1730,6 +1876,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)installSettingsGestureOnWindow:(UIWindow *)window {
+    // 三指手势安装在宿主窗口而不是 HUD 上，确保它不会被插件自己的
+    // 面板层级影响；关闭开关时只禁用已有识别器。
     if (!window || ASIsSystemInputWindow(window) || [window isKindOfClass:[SplashAwayHUDWindow class]]) return;
     BOOL enabled = [self threeFingerEnabled];
     UIGestureRecognizer *existing = objc_getAssociatedObject(window, &kASGestureInstalledKey);
@@ -1747,6 +1895,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onSettingsGesture:(UILongPressGestureRecognizer *)gesture {
+    // 长按状态只响应 Began，避免 Changed/Ended 阶段重复打开面板。
     if (gesture.state != UIGestureRecognizerStateBegan) return;
     UIWindow *window = gesture.view.window ?: (UIWindow *)gesture.view;
     [self presentSettingsInWindow:window];
@@ -1755,6 +1904,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 设置面板
 
 - (void)presentSettingsInWindow:(UIWindow *)window {
+    // 打开面板会暂停自动跳过会话，并隐藏当前提示；这样用户编辑开关
+    // 或录制坐标时不会被后台流程同时点击宿主界面。
     if (self.pickOverlay) return;
     if (self.panelView) {
         [self rebuildPanel];
@@ -1835,6 +1986,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)dismissPanelThen:(void (^)(void))completion {
+    // 面板退出完成后再执行录制或标记回调，保证旧的约束和触摸层已经
+    // 从 HUD 根视图移除。
     UIView *panel = self.panelView;
     self.panelView = nil;
     self.panelStack = nil;
@@ -1865,6 +2018,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (UIView *)groupWithRows:(NSArray<UIView *> *)rows {
+    // 统一生成带分隔线的圆角分组，避免每个设置项重复实现背景和间距。
     UIStackView *group = [[UIStackView alloc] init];
     group.axis = UILayoutConstraintAxisVertical;
     group.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
@@ -1884,6 +2038,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (UIView *)switchRowWithTitle:(NSString *)title detail:(NSString *)detail symbol:(NSString *)symbol key:(NSString *)key tag:(NSInteger)tag {
+    // 开关的 tag 是面板开关到 Defaults key 的索引，映射关系集中在
+    // onPanelSwitch 中处理，便于折叠栏和新增开关共享同一套 UI。
     UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:symbol]];
     icon.tintColor = ASAccentColor();
     icon.contentMode = UIViewContentModeCenter;
@@ -1915,6 +2071,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (UIButton *)actionButtonWithTitle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action enabled:(BOOL)enabled destructive:(BOOL)destructive {
+    // 坐标操作按钮统一由这里创建；破坏性操作只改变视觉强调，不在
+    // 此处直接执行，清除逻辑仍由 onPanelClear 的二次确认负责。
     UIColor *tint = destructive ? [UIColor colorWithRed:1.0 green:0.42 blue:0.40 alpha:1.0] : ASAccentColor();
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
@@ -1953,6 +2111,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)rebuildPanel {
+    // 面板采用“完整重建”而不是逐项修改约束。开关和坐标数量变化时，
+    // 这样更不容易留下旧的 arrangedSubview 或错误的折叠高度。
     UIStackView *stack = self.panelStack;
     if (!stack) return;
     for (UIView *view in stack.arrangedSubviews) {
@@ -2100,6 +2260,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (NSString *)switchSummaryText {
+    // 折叠状态下仍显示关闭项，用户不展开列表也能知道哪些功能被停用。
     NSArray<NSArray<NSString *> *> *items = @[
         @[@"启用", kASEnabledDefaultsKey], @[@"文字识别", kASOCRDefaultsKey], @[@"右上角兜底", kASCornerDefaultsKey],
         @[@"弹窗清理", kASPopupDefaultsKey], @[@"全程监听", kASWatchDefaultsKey], @[@"启动提示", kASLaunchToastDefaultsKey],
@@ -2114,6 +2275,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onSwitchHeaderTap {
+    // 折叠栏只改变自身内容和箭头状态；开关值仍由每个 UISwitch 单独
+    // 写入，避免点击标题栏意外改变功能设置。
     UIView *group = self.switchGroup;
     if (!group) return;
     BOOL expand = !self.switchesExpanded;
@@ -2129,6 +2292,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPanelSwitch:(UISwitch *)toggle {
+    // 启动提示和三指长按至少保留一个入口，防止用户把自己锁在设置面板外。
+    // 其他开关修改后立即刷新缓存，下一次扫描即可使用新值。
     NSArray<NSString *> *keys = @[@"", kASEnabledDefaultsKey, kASOCRDefaultsKey, kASCornerDefaultsKey, kASLaunchToastDefaultsKey, kASThreeFingerDefaultsKey,
                                   kASPopupDefaultsKey, kASWatchDefaultsKey];
     if (toggle.tag <= 0 || toggle.tag >= (NSInteger)keys.count) return;
@@ -2153,6 +2318,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPanelRecord {
+    // 先关闭面板再进入录制，避免面板的 HUD 控件挡住用户真正想记录的点。
     UIWindow *host = [self resolveHostWindow:nil];
     [self dismissPanelThen:^{
         [self beginPickingInWindow:host];
@@ -2160,6 +2326,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPanelShowMarkers {
+    // 查看坐标使用与录制相同的屏幕坐标转换路径，专门避免标记落在左上角。
     UIWindow *host = [self resolveHostWindow:nil];
     [self dismissPanelThen:^{
         [self showPointMarkersInWindow:host duration:2.5 completion:^{
@@ -2169,6 +2336,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPanelUndo {
+    // 撤销始终只删除最后一个点，并同步删除同下标的控件签名。
     if (self.customPoints.count == 0) return;
     NSUInteger removedNumber = self.customPoints.count;
     [self.customPoints removeLastObject];
@@ -2181,6 +2349,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPanelClear {
+    // 清除采用两次点击确认，并设置短暂确认窗口，避免误触导致当前
+    // 应用已经录制好的坐标全部丢失。
     if (self.customPoints.count == 0) return;
     if (!self.clearArmed) {
         self.clearArmed = YES;
@@ -2206,6 +2376,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark 录制坐标
 
 - (void)beginPickingInWindow:(UIWindow *)window {
+    // 录制层位于独立 HUD 上，底部提示卡可以拖动；点击事件只接受
+    // 遮罩本身，提示卡和取消按钮不会被误录成坐标。
     UIWindow *host = [self resolveHostWindow:window];
     if (!host || self.pickOverlay) return;
     [self stopSession];
@@ -2282,11 +2454,15 @@ static BOOL gASWatchActive = NO;
 }
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    // 录制遮罩的 tap 只接收 overlay 自己的触摸，卡片拖动和取消按钮
+    // 由它们各自的手势/控件处理。
     if (gestureRecognizer.view != self.pickOverlay) return YES;
     return touch.view == self.pickOverlay;
 }
 
 - (void)onOverlayTap:(UITapGestureRecognizer *)tap {
+    // 把录制点立即转换成屏幕坐标并校验，再保存控件签名；
+    // 屏幕坐标是唯一持久化坐标系，防止窗口坐标变化造成偏移。
     UIView *overlay = self.pickOverlay;
     UIWindow *hudWindow = overlay.window;
     if (!overlay || !hudWindow) return;
@@ -2317,6 +2493,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPickPillPan:(UIPanGestureRecognizer *)pan {
+    // 拖动提示卡时只修改 HUD 局部 transform，并按安全区限制边界，
+    // 不会影响已经录制的屏幕坐标。
     UIView *pill = pan.view;
     UIView *container = pill.superview;
     if (!pill || !container) return;
@@ -2335,6 +2513,7 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onOverlayCancel {
+    // 取消只移除录制层，不修改已保存的坐标；随后返回设置面板。
     UIView *overlay = self.pickOverlay;
     self.pickOverlay = nil;
     [overlay removeFromSuperview];
@@ -2348,6 +2527,8 @@ static BOOL gASWatchActive = NO;
 #pragma mark - 入口
 
 static void ASInstallUIHooks(void) {
+    // 监听只挂在通用的 viewDidAppear/addSubview 上，用于捕捉新页面和
+    // 全屏遮罩。所有回调都先调用原实现，再做轻量登记，避免破坏宿主行为。
     Method appear = class_getInstanceMethod([UIViewController class], @selector(viewDidAppear:));
     if (appear) {
         __block void (*originalAppear)(id, SEL, BOOL) = NULL;
@@ -2385,6 +2566,8 @@ static void ASInstallUIHooks(void) {
 }
 
 static void ASMigrateLegacyDefaults(void) {
+    // 包名和工程名改过后，旧版本仍可能留下 AdSkip.* 设置。
+    // 只迁移不存在的新 key，避免覆盖用户已经在新版本中修改的值。
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     NSDictionary<NSString *, id> *all = [defaults dictionaryRepresentation];
     for (NSString *key in all) {
@@ -2397,6 +2580,8 @@ static void ASMigrateLegacyDefaults(void) {
 
 %ctor {
     @autoreleasepool {
+        // 动态库加载时只完成轻量初始化和通知注册；真正的窗口扫描由
+        // UIApplication 生命周期通知触发，避免过早访问宿主 UIKit。
         if (!ASShouldRunInProcess()) return;
         ASMigrateLegacyDefaults();
         [SplashAwayEngine shared];
