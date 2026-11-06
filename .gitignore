@@ -1,0 +1,7 @@
+.theos/
+packages/
+dist/
+*.deb
+çè·³è·³_*.dylib
+.mt-analysis/
+.DS_Store
