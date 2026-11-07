@@ -38,11 +38,8 @@ static const NSTimeInterval kASCornerFallbackDelay = 3.0;
 static const NSInteger kASScanNodeBudget = 4000;
 static char kASGestureInstalledKey;
 static NSString *const kASPointsDefaultsKey = @"SplashAway.customPoints";
-static NSString *const kASThreeFingerDefaultsKey = @"SplashAway.threeFingerEnabled";
-static NSString *const kASEnabledDefaultsKey = @"SplashAway.enabled";
 static NSString *const kASOCRDefaultsKey = @"SplashAway.ocrEnabled";
 static NSString *const kASCornerDefaultsKey = @"SplashAway.cornerEnabled";
-static NSString *const kASLaunchToastDefaultsKey = @"SplashAway.launchToastEnabled";
 static NSString *const kASSkipCountDefaultsKey = @"SplashAway.skipCount";
 static NSString *const kASLastMethodDefaultsKey = @"SplashAway.lastSkipMethod";
 static NSString *const kASLastDateDefaultsKey = @"SplashAway.lastSkipDate";
@@ -55,7 +52,49 @@ static const NSTimeInterval kASPopupStartDelay = 0.5;
 static const NSInteger kASPopupNodeBudget = 2500;
 static const NSTimeInterval kASPointWatchInterval = 1.0;
 static const NSTimeInterval kASPointCooldown = 4.0;
-static NSString *const kASVersion = @"0.0.3";
+// 原版首轮检查约在启动两秒后执行，给开屏页面完成布局和转场的时间。
+static const NSTimeInterval kASInitialCheckDelay = 2.0;
+static NSString *const kASVersion = @"0.0.4";
+// 在线更新只读取 GitHub Tag，不下载或替换当前已经加载的动态库。
+static NSString *const kASUpdateCheckDateDefaultsKey = @"SplashAway.updateCheckDate";
+static NSString *const kASUpdateLatestTagDefaultsKey = @"SplashAway.updateLatestTag";
+static NSString *const kASUpdateTagsURLString = @"https://api.github.com/repos/susu123oss/adgo/tags?per_page=20";
+static const NSTimeInterval kASUpdateCheckInterval = 86400.0;
+
+typedef NS_ENUM(NSInteger, ASUpdateStatus) {
+    ASUpdateStatusIdle = 0,
+    ASUpdateStatusChecking,
+    ASUpdateStatusLatest,
+    ASUpdateStatusAvailable,
+    ASUpdateStatusFailed,
+};
+
+// Tag 必须是稳定的三段式版本，例如 v0.0.4；预发布标签不参与比较。
+static BOOL ASParseTagVersion(NSString *tag, NSInteger *major, NSInteger *minor, NSInteger *patch) {
+    if (tag.length == 0) return NO;
+    NSRegularExpression *expression = [NSRegularExpression regularExpressionWithPattern:@"^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" options:0 error:nil];
+    NSTextCheckingResult *match = [expression firstMatchInString:tag options:0 range:NSMakeRange(0, tag.length)];
+    if (!match) return NO;
+    if (major) *major = [[tag substringWithRange:[match rangeAtIndex:1]] integerValue];
+    if (minor) *minor = [[tag substringWithRange:[match rangeAtIndex:2]] integerValue];
+    if (patch) *patch = [[tag substringWithRange:[match rangeAtIndex:3]] integerValue];
+    return YES;
+}
+
+static NSComparisonResult ASCompareTagVersions(NSString *left, NSString *right) {
+    NSInteger leftMajor = 0;
+    NSInteger leftMinor = 0;
+    NSInteger leftPatch = 0;
+    NSInteger rightMajor = 0;
+    NSInteger rightMinor = 0;
+    NSInteger rightPatch = 0;
+    if (!ASParseTagVersion(left, &leftMajor, &leftMinor, &leftPatch)) return NSOrderedAscending;
+    if (!ASParseTagVersion(right, &rightMajor, &rightMinor, &rightPatch)) return NSOrderedDescending;
+    if (leftMajor != rightMajor) return leftMajor > rightMajor ? NSOrderedDescending : NSOrderedAscending;
+    if (leftMinor != rightMinor) return leftMinor > rightMinor ? NSOrderedDescending : NSOrderedAscending;
+    if (leftPatch != rightPatch) return leftPatch > rightPatch ? NSOrderedDescending : NSOrderedAscending;
+    return NSOrderedSame;
+}
 
 // 统一的强调色用于点击反馈、录制标记和自定义设置面板。
 static UIColor *ASAccentColor(void) {
@@ -734,11 +773,20 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 @property (nonatomic, assign) BOOL enabledOn;
 @property (nonatomic, assign) BOOL popupOn;
 @property (nonatomic, assign) BOOL watchOn;
+// 更新状态保存在引擎中，面板重建时可以稳定恢复显示，不依赖某个旧的 UI 实例。
+@property (nonatomic, copy) NSString *latestTagName;
+@property (nonatomic, strong) NSURL *latestTagURL;
+@property (nonatomic, assign) ASUpdateStatus updateStatus;
+@property (nonatomic, assign) BOOL updateCheckInFlight;
+@property (nonatomic, weak) UILabel *updateTitleLabel;
+@property (nonatomic, weak) UILabel *updateDetailLabel;
 + (instancetype)shared;
 - (void)markActivationAndStart;
 - (void)handleWindowBecameVisible:(UIWindow *)window;
 - (void)scheduleLaunchToastAttempt:(NSInteger)attempt;
 - (void)noteUIChange:(UIView *)root fresh:(BOOL)fresh;
+- (void)checkForUpdatesIfNeeded:(BOOL)force;
+- (void)onUpdateRowTap;
 @end
 
 static BOOL gASWatchActive = NO;
@@ -768,6 +816,7 @@ static BOOL gASWatchActive = NO;
         _freshRoots = [NSHashTable weakObjectsHashTable];
         [self loadCustomPoints];
         [self refreshCachedSettings];
+        [self loadUpdateCache];
     }
     return self;
 }
@@ -775,11 +824,142 @@ static BOOL gASWatchActive = NO;
 - (void)refreshCachedSettings {
     // 高频路径读取缓存字段而不是每个 tick 都反复访问 NSUserDefaults；
     // 设置面板修改开关后会再次调用这里立即生效。
-    self.enabledOn = [self boolForKey:kASEnabledDefaultsKey];
+    // 插件对当前注入的应用固定启用，不再提供“在本应用启用”开关。
+    self.enabledOn = YES;
     self.popupOn = [self boolForKey:kASPopupDefaultsKey];
     self.watchOn = [self boolForKey:kASWatchDefaultsKey];
     gASWatchActive = self.enabledOn && self.watchOn;
     [self updatePointWatcher];
+}
+
+#pragma mark 在线更新
+
+- (void)loadUpdateCache {
+    // 只缓存最近一次识别到的 Tag 和检查时间。缓存过期后仍先显示旧状态，
+    // 随后由面板或启动后的延迟任务发起新请求，避免网络抖动时界面空白。
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSString *cachedTag = [defaults stringForKey:kASUpdateLatestTagDefaultsKey];
+    if (ASParseTagVersion(cachedTag, NULL, NULL, NULL)) {
+        self.latestTagName = cachedTag;
+        self.latestTagURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://github.com/susu123oss/adgo/releases/tag/%@", cachedTag]];
+        self.updateStatus = ASCompareTagVersions(cachedTag, [@"v" stringByAppendingString:kASVersion]) == NSOrderedDescending
+            ? ASUpdateStatusAvailable
+            : ASUpdateStatusLatest;
+    } else {
+        self.updateStatus = ASUpdateStatusIdle;
+    }
+}
+
+- (NSString *)updateDetailText {
+    switch (self.updateStatus) {
+        case ASUpdateStatusChecking:
+            return @"正在检查 GitHub Tag…";
+        case ASUpdateStatusLatest:
+            return [NSString stringWithFormat:@"已是最新 v%@ · 点击重新检查", kASVersion];
+        case ASUpdateStatusAvailable:
+            return [NSString stringWithFormat:@"发现新版本 %@ · 点击查看", self.latestTagName ?: @"新版本"];
+        case ASUpdateStatusFailed:
+            return @"检查失败 · 点击重试";
+        case ASUpdateStatusIdle:
+        default:
+            return @"点击检查 GitHub Tag";
+    }
+}
+
+- (void)refreshUpdateLabels {
+    // 面板打开期间请求可能异步返回；保留这一层更新方法，避免直接操作
+    // 已被重建的旧控件，也让请求结果可以无感地刷新当前行。
+    self.updateTitleLabel.text = @"在线更新";
+    self.updateDetailLabel.text = [self updateDetailText];
+    self.updateDetailLabel.textColor = [UIColor colorWithWhite:1 alpha:self.updateStatus == ASUpdateStatusAvailable ? 0.9 : 0.5];
+}
+
+- (void)checkForUpdatesIfNeeded:(BOOL)force {
+    if (self.updateCheckInFlight) return;
+    // 自动检查更新固定开启；旧版本保存过的关闭值不再影响更新检测。
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    NSDate *lastCheck = [defaults objectForKey:kASUpdateCheckDateDefaultsKey];
+    BOOL cacheFresh = lastCheck && [[NSDate date] timeIntervalSinceDate:lastCheck] < kASUpdateCheckInterval;
+    if (!force && cacheFresh && self.latestTagName.length > 0) {
+        [self refreshUpdateLabels];
+        return;
+    }
+
+    NSURL *url = [NSURL URLWithString:kASUpdateTagsURLString];
+    if (!url) {
+        self.updateStatus = ASUpdateStatusFailed;
+        [self refreshUpdateLabels];
+        return;
+    }
+    self.updateCheckInFlight = YES;
+    self.updateStatus = ASUpdateStatusChecking;
+    [self refreshUpdateLabels];
+
+    // GitHub API 是公开只读接口，不需要用户令牌；明确设置 User-Agent，
+    // 也不把宿主应用的 Cookie 或其他认证信息带给更新服务。
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
+                                                            cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                        timeoutInterval:15.0];
+    [request setValue:@"SplashAway-UpdateChecker/1" forHTTPHeaderField:@"User-Agent"];
+    [request setValue:@"application/vnd.github+json" forHTTPHeaderField:@"Accept"];
+
+    __weak typeof(self) weakSelf = self;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
+                                                                  completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SplashAwayEngine *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            strongSelf.updateCheckInFlight = NO;
+            [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kASUpdateCheckDateDefaultsKey];
+
+            NSHTTPURLResponse *httpResponse = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
+            if (error || httpResponse.statusCode < 200 || httpResponse.statusCode >= 300 || data.length == 0) {
+                strongSelf.updateStatus = ASUpdateStatusFailed;
+                [strongSelf refreshUpdateLabels];
+                return;
+            }
+
+            NSError *jsonError = nil;
+            id payload = [NSJSONSerialization JSONObjectWithData:data options:0 error:&jsonError];
+            if (jsonError || ![payload isKindOfClass:[NSArray class]]) {
+                strongSelf.updateStatus = ASUpdateStatusFailed;
+                [strongSelf refreshUpdateLabels];
+                return;
+            }
+
+            NSString *currentTag = [@"v" stringByAppendingString:kASVersion];
+            NSString *bestTag = nil;
+            for (id item in (NSArray *)payload) {
+                if (![item isKindOfClass:[NSDictionary class]]) continue;
+                NSString *tag = [(NSDictionary *)item[@"name"] isKindOfClass:[NSString class]] ? item[@"name"] : nil;
+                if (!ASParseTagVersion(tag, NULL, NULL, NULL)) continue;
+                if (!bestTag || ASCompareTagVersions(tag, bestTag) == NSOrderedDescending) bestTag = tag;
+            }
+            if (!bestTag) {
+                strongSelf.updateStatus = ASUpdateStatusFailed;
+                [strongSelf refreshUpdateLabels];
+                return;
+            }
+
+            strongSelf.latestTagName = bestTag;
+            strongSelf.latestTagURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://github.com/susu123oss/adgo/releases/tag/%@", bestTag]];
+            [[NSUserDefaults standardUserDefaults] setObject:bestTag forKey:kASUpdateLatestTagDefaultsKey];
+            strongSelf.updateStatus = ASCompareTagVersions(bestTag, currentTag) == NSOrderedDescending
+                ? ASUpdateStatusAvailable
+                : ASUpdateStatusLatest;
+            [strongSelf refreshUpdateLabels];
+        });
+    }];
+    [task resume];
+}
+
+- (void)onUpdateRowTap {
+    if (self.updateStatus == ASUpdateStatusAvailable && self.latestTagURL) {
+        // 只打开发布页，不在宿主进程内下载、解压或替换 dylib。
+        [[UIApplication sharedApplication] openURL:self.latestTagURL options:@{} completionHandler:nil];
+        return;
+    }
+    [self checkForUpdatesIfNeeded:YES];
 }
 
 #pragma mark 坐标持久化
@@ -975,21 +1155,19 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)handleWindowBecameVisible:(UIWindow *)window {
-    // 新窗口通常意味着页面、广告或弹窗出现。先登记被动监听，再决定
-    // 是否启动一次短时高频会话。
+    // 新窗口通常意味着页面、广告或弹窗出现。这里只登记被动监听和设置手势，
+    // 不再因为普通启动窗口、键盘窗口或系统窗口重新启动盲点点击会话。
+    // 高频会话只由应用启动和回前台触发，避免开屏期间重复进入点击流程。
     if ([window isKindOfClass:[SplashAwayHUDWindow class]]) return;
     [self installSettingsGestureOnWindow:window];
     if (!ASIsSystemInputWindow(window)) [self noteUIChange:window fresh:YES];
-    if (self.hasTriggered || self.isMonitoring || self.pickOverlay || self.panelView) return;
-    if (CFAbsoluteTimeGetCurrent() - self.lastActivation > kASActivationWindow) return;
-    [self startSession];
 }
 
 - (void)startSession {
     // 每次会话都清空本轮的“已尝试”状态；计时器运行在主队列，保证
     // UIKit 视图遍历、点击和 UI 更新不会跨线程执行。
     [self stopSession];
-    if (![self boolForKey:kASEnabledDefaultsKey]) return;
+    if (!self.enabledOn) return;
     self.hasTriggered = NO;
     self.ocrInFlight = NO;
     self.customPointsTried = NO;
@@ -1002,7 +1180,7 @@ static BOOL gASWatchActive = NO;
 
     self.scanTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(self.scanTimer,
-                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kASInitialCheckDelay * NSEC_PER_SEC)),
                               (uint64_t)(kASTickInterval * NSEC_PER_SEC),
                               (uint64_t)(0.05 * NSEC_PER_SEC));
     __weak typeof(self) weakSelf = self;
@@ -1517,7 +1695,8 @@ static BOOL gASWatchActive = NO;
 }
 
 - (BOOL)threeFingerEnabled {
-    return [self boolForKey:kASThreeFingerDefaultsKey];
+    // 三指长按固定开启，始终保留一个不依赖启动提示的设置入口。
+    return YES;
 }
 
 - (void)recordSkipWithMethod:(NSString *)method {
@@ -1855,13 +2034,16 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)showLaunchToast {
-    // 启动提示既是状态反馈，也是关闭三指手势后的备用入口；
-    // 因此只有用户明确关闭启动提示时才不显示。
-    if (![self boolForKey:kASLaunchToastDefaultsKey] || self.panelView || self.pickOverlay) return;
-    BOOL enabled = [self boolForKey:kASEnabledDefaultsKey];
-    NSString *title = enabled ? @"开屏广告走开 · 已就绪" : @"开屏广告走开 · 已暂停";
-    UIView *pill = [self makePillWithTitle:title detail:@"点此打开设置"
-                                    symbol:enabled ? @"bolt.fill" : @"pause.circle.fill"
+    // 启动提示和三指长按都固定开启，始终保留两个设置入口。
+    if (self.panelView || self.pickOverlay) return;
+    BOOL enabled = YES;
+    BOOL hasUpdate = self.updateStatus == ASUpdateStatusAvailable && self.latestTagName.length > 0;
+    NSString *title = hasUpdate
+        ? [NSString stringWithFormat:@"发现新版本 %@", self.latestTagName]
+        : (enabled ? @"开屏广告走开 · 已就绪" : @"开屏广告走开 · 已暂停");
+    NSString *detail = hasUpdate ? @"点此打开设置查看" : @"点此打开设置";
+    UIView *pill = [self makePillWithTitle:title detail:detail
+                                    symbol:hasUpdate ? @"arrow.down.circle.fill" : (enabled ? @"bolt.fill" : @"pause.circle.fill")
                                   inWindow:ASVisibleWindows().firstObject];
     if (!pill) return;
     pill.userInteractionEnabled = YES;
@@ -1909,6 +2091,7 @@ static BOOL gASWatchActive = NO;
     if (self.pickOverlay) return;
     if (self.panelView) {
         [self rebuildPanel];
+        [self checkForUpdatesIfNeeded:NO];
         return;
     }
     UIWindow *host = [self resolveHostWindow:window];
@@ -1974,6 +2157,7 @@ static BOOL gASWatchActive = NO;
     self.panelStack = stack;
     [self rebuildPanel];
     [root addSubview:panel];
+    [self checkForUpdatesIfNeeded:NO];
 
     backdrop.alpha = 0;
     card.alpha = 0;
@@ -2070,6 +2254,54 @@ static BOOL gASWatchActive = NO;
     return row;
 }
 
+- (UIView *)updateRow {
+    // 在线更新使用普通可点击行而不是 UISwitch：点击有新版本时打开
+    // GitHub 发布页，其他状态则重新检查，避免增加一个容易误解的开关。
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"arrow.down.circle"]];
+    icon.tintColor = ASAccentColor();
+    icon.contentMode = UIViewContentModeCenter;
+    icon.preferredSymbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold];
+    [icon.widthAnchor constraintEqualToConstant:24].active = YES;
+
+    UILabel *title = [self labelWithText:@"在线更新" size:15 weight:UIFontWeightMedium alpha:0.95];
+    UILabel *detail = [self labelWithText:[self updateDetailText] size:12 weight:UIFontWeightRegular alpha:0.5];
+    detail.numberOfLines = 1;
+    detail.lineBreakMode = NSLineBreakByTruncatingTail;
+    self.updateTitleLabel = title;
+    self.updateDetailLabel = detail;
+
+    UIStackView *texts = [[UIStackView alloc] initWithArrangedSubviews:@[title, detail]];
+    texts.axis = UILayoutConstraintAxisVertical;
+    texts.spacing = 2;
+
+    UIImageView *arrow = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"chevron.right"]];
+    arrow.tintColor = [UIColor colorWithWhite:1 alpha:0.45];
+    arrow.contentMode = UIViewContentModeCenter;
+    arrow.preferredSymbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightSemibold];
+    [arrow.widthAnchor constraintEqualToConstant:18].active = YES;
+
+    UIStackView *content = [[UIStackView alloc] initWithArrangedSubviews:@[icon, texts, arrow]];
+    content.axis = UILayoutConstraintAxisHorizontal;
+    content.alignment = UIStackViewAlignmentCenter;
+    content.spacing = 12;
+    content.userInteractionEnabled = NO;
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIControl *row = [[UIControl alloc] init];
+    row.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    row.layer.cornerRadius = 16;
+    row.layer.cornerCurve = kCACornerCurveContinuous;
+    [row addTarget:self action:@selector(onUpdateRowTap) forControlEvents:UIControlEventTouchUpInside];
+    [row addSubview:content];
+    [NSLayoutConstraint activateConstraints:@[
+        [content.topAnchor constraintEqualToAnchor:row.topAnchor constant:11],
+        [content.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-11],
+        [content.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:12],
+        [content.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-12],
+    ]];
+    return row;
+}
+
 - (UIButton *)actionButtonWithTitle:(NSString *)title symbol:(NSString *)symbol action:(SEL)action enabled:(BOOL)enabled destructive:(BOOL)destructive {
     // 坐标操作按钮统一由这里创建；破坏性操作只改变视觉强调，不在
     // 此处直接执行，清除逻辑仍由 onPanelClear 的二次确认负责。
@@ -2119,7 +2351,7 @@ static BOOL gASWatchActive = NO;
         [stack removeArrangedSubview:view];
         [view removeFromSuperview];
     }
-    BOOL enabled = [self boolForKey:kASEnabledDefaultsKey];
+    BOOL enabled = self.enabledOn;
 
     UIImageView *logo = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"bolt.fill"]];
     logo.tintColor = [UIColor blackColor];
@@ -2221,13 +2453,10 @@ static BOOL gASWatchActive = NO;
     [stack setCustomSpacing:8 afterView:switchHeader];
 
     UIView *switchGroup = [self groupWithRows:@[
-        [self switchRowWithTitle:@"在本应用启用" detail:@"关闭后不再自动跳过" symbol:@"power" key:kASEnabledDefaultsKey tag:1],
-        [self switchRowWithTitle:@"文字识别" detail:@"截图识别“跳过”文字" symbol:@"text.viewfinder" key:kASOCRDefaultsKey tag:2],
-        [self switchRowWithTitle:@"右上角兜底" detail:@"都没找到时点一次右上角" symbol:@"arrow.up.right.circle" key:kASCornerDefaultsKey tag:3],
-        [self switchRowWithTitle:@"弹窗清理" detail:@"关掉更新、通知、评分等弹窗" symbol:@"xmark.rectangle" key:kASPopupDefaultsKey tag:6],
-        [self switchRowWithTitle:@"全程监听" detail:@"使用中出现的广告和弹窗也处理" symbol:@"eye" key:kASWatchDefaultsKey tag:7],
-        [self switchRowWithTitle:@"启动提示" detail:@"启动时显示入口提示" symbol:@"bell" key:kASLaunchToastDefaultsKey tag:4],
-        [self switchRowWithTitle:@"三指长按" detail:@"随时三指长按打开设置" symbol:@"hand.raised" key:kASThreeFingerDefaultsKey tag:5],
+        [self switchRowWithTitle:@"文字识别" detail:@"截图识别“跳过”文字" symbol:@"text.viewfinder" key:kASOCRDefaultsKey tag:1],
+        [self switchRowWithTitle:@"右上角兜底" detail:@"都没找到时点一次右上角" symbol:@"arrow.up.right.circle" key:kASCornerDefaultsKey tag:2],
+        [self switchRowWithTitle:@"弹窗清理" detail:@"关掉更新、通知、评分等弹窗" symbol:@"xmark.rectangle" key:kASPopupDefaultsKey tag:3],
+        [self switchRowWithTitle:@"全程监听" detail:@"使用中出现的广告和弹窗也处理" symbol:@"eye" key:kASWatchDefaultsKey tag:4],
     ]];
     switchGroup.hidden = !self.switchesExpanded;
     switchGroup.alpha = self.switchesExpanded ? 1 : 0;
@@ -2235,6 +2464,10 @@ static BOOL gASWatchActive = NO;
     self.switchGroup = switchGroup;
     self.switchChevron = chevron;
     self.switchSummary = summary;
+
+    UIView *updateRow = [self updateRow];
+    [stack addArrangedSubview:updateRow];
+    [stack setCustomSpacing:8 afterView:updateRow];
 
     NSUInteger points = self.customPoints.count;
     UILabel *pointsTitle = [self labelWithText:points > 0 ? [NSString stringWithFormat:@"自定义坐标 · %lu 个", (unsigned long)points] : @"自定义坐标 · 未录制"
@@ -2254,7 +2487,7 @@ static BOOL gASWatchActive = NO;
     actions.spacing = 8;
     [stack addArrangedSubview:actions];
 
-    UILabel *footer = [self labelWithText:[NSString stringWithFormat:@"v%@ · 设置只对当前应用生效", kASVersion] size:11 weight:UIFontWeightRegular alpha:0.35];
+    UILabel *footer = [self labelWithText:[NSString stringWithFormat:@"v%@ · 自动检查更新、三指长按默认开启", kASVersion] size:11 weight:UIFontWeightRegular alpha:0.35];
     footer.textAlignment = NSTextAlignmentCenter;
     [stack addArrangedSubview:footer];
 }
@@ -2262,9 +2495,8 @@ static BOOL gASWatchActive = NO;
 - (NSString *)switchSummaryText {
     // 折叠状态下仍显示关闭项，用户不展开列表也能知道哪些功能被停用。
     NSArray<NSArray<NSString *> *> *items = @[
-        @[@"启用", kASEnabledDefaultsKey], @[@"文字识别", kASOCRDefaultsKey], @[@"右上角兜底", kASCornerDefaultsKey],
-        @[@"弹窗清理", kASPopupDefaultsKey], @[@"全程监听", kASWatchDefaultsKey], @[@"启动提示", kASLaunchToastDefaultsKey],
-        @[@"三指长按", kASThreeFingerDefaultsKey],
+        @[@"文字识别", kASOCRDefaultsKey], @[@"右上角兜底", kASCornerDefaultsKey],
+        @[@"弹窗清理", kASPopupDefaultsKey], @[@"全程监听", kASWatchDefaultsKey],
     ];
     NSMutableArray<NSString *> *off = [NSMutableArray array];
     for (NSArray<NSString *> *item in items) {
@@ -2292,29 +2524,17 @@ static BOOL gASWatchActive = NO;
 }
 
 - (void)onPanelSwitch:(UISwitch *)toggle {
-    // 启动提示和三指长按至少保留一个入口，防止用户把自己锁在设置面板外。
-    // 其他开关修改后立即刷新缓存，下一次扫描即可使用新值。
-    NSArray<NSString *> *keys = @[@"", kASEnabledDefaultsKey, kASOCRDefaultsKey, kASCornerDefaultsKey, kASLaunchToastDefaultsKey, kASThreeFingerDefaultsKey,
-                                  kASPopupDefaultsKey, kASWatchDefaultsKey];
+    // 启动提示、三指长按和自动检查更新固定开启，不映射到面板开关。
+    NSArray<NSString *> *keys = @[@"", kASOCRDefaultsKey, kASCornerDefaultsKey, kASPopupDefaultsKey,
+                                  kASWatchDefaultsKey];
     if (toggle.tag <= 0 || toggle.tag >= (NSInteger)keys.count) return;
     NSString *key = keys[toggle.tag];
     UIWindow *host = [self resolveHostWindow:nil];
 
-    if (!toggle.on && (toggle.tag == 4 || toggle.tag == 5)) {
-        NSString *otherKey = toggle.tag == 4 ? kASThreeFingerDefaultsKey : kASLaunchToastDefaultsKey;
-        if (![self boolForKey:otherKey]) {
-            [toggle setOn:YES animated:YES];
-            [[[UINotificationFeedbackGenerator alloc] init] notificationOccurred:UINotificationFeedbackTypeWarning];
-            [self showToast:@"启动提示和三指长按至少保留一个" symbol:@"exclamationmark.triangle.fill" inWindow:host];
-            return;
-        }
-    }
     [[[UISelectionFeedbackGenerator alloc] init] selectionChanged];
     [self setBool:toggle.on forKey:key];
     [self refreshCachedSettings];
     self.switchSummary.text = [self switchSummaryText];
-    if (toggle.tag == 5) [self refreshSettingsGestures];
-    if (toggle.tag == 1) [self rebuildPanel];
 }
 
 - (void)onPanelRecord {
@@ -2592,6 +2812,10 @@ static void ASMigrateLegacyDefaults(void) {
         [center addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:mainQueue usingBlock:^(NSNotification *note) {
             [[SplashAwayEngine shared] markActivationAndStart];
             [[SplashAwayEngine shared] scheduleLaunchToastAttempt:0];
+            // 启动后延迟检查，避免把 GitHub 网络请求放在宿主首屏关键路径上。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [[SplashAwayEngine shared] checkForUpdatesIfNeeded:NO];
+            });
         }];
         [center addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:mainQueue usingBlock:^(NSNotification *note) {
             [[SplashAwayEngine shared] markActivationAndStart];

@@ -34,13 +34,13 @@ before-package::
 
 after-all::
 	@mkdir -p dist
-	@([ -f .theos/obj/SplashAway.dylib ] && cp -f .theos/obj/SplashAway.dylib "dist/$(OUTPUT_NAME).dylib" || cp -f .theos/obj/debug/SplashAway.dylib "dist/$(OUTPUT_NAME).dylib")
+	@cp -f .theos/obj/debug/SplashAway.dylib "dist/$(OUTPUT_NAME).dylib"
 	@cp -f SplashAway.plist "dist/$(OUTPUT_NAME).plist"
 	@echo "==> 已同步最新双架构 dylib 至 dist/ (arm64 + arm64e)"
 
 after-package::
 	@mkdir -p dist
-	@([ -f .theos/obj/SplashAway.dylib ] && cp -f .theos/obj/SplashAway.dylib "dist/$(OUTPUT_NAME).dylib" || cp -f .theos/obj/debug/SplashAway.dylib "dist/$(OUTPUT_NAME).dylib")
+	@cp -f .theos/obj/debug/SplashAway.dylib "dist/$(OUTPUT_NAME).dylib"
 	@cp -f SplashAway.plist "dist/$(OUTPUT_NAME).plist"
 	@python3 -c "import os; [os.remove('dist/SplashAway'+e) for e in ('.dylib','.plist') if os.path.exists('dist/SplashAway'+e)]"
 	@python3 -c "import glob, os; files = sorted(glob.glob('packages/*.deb'), key=os.path.getmtime); [os.remove(f) for f in files[:-1]] if len(files) > 1 else None"
