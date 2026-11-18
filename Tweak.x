@@ -372,6 +372,24 @@ static BOOL ASIsGenericViewClass(UIView *view) {
            [name containsString:@"DropShadow"] || [name containsString:@"LayoutContainer"];
 }
 
+static BOOL ASViewHasVisibleImage(UIView *view) {
+    if (![view isKindOfClass:[UIImageView class]]) return NO;
+    UIImageView *imageView = (UIImageView *)view;
+    return imageView.image != nil || imageView.highlightedImage != nil;
+}
+
+static BOOL ASViewLooksLikeVisualLeaf(UIView *view) {
+    // 一些广告按钮是自绘 UIView，没有 UIControl、文字或手势，
+    // 但通常会表现为一个没有子视图的可交互叶节点。把这类小节点
+    // 纳入录制候选，才能覆盖音量、关闭图标和自绘按钮。
+    if (!view || view.subviews.count > 0) return NO;
+    if (ASViewHasVisibleImage(view)) return YES;
+    if (!view.userInteractionEnabled) return NO;
+    if ([view isKindOfClass:[UIControl class]]) return YES;
+    NSString *className = NSStringFromClass([view class]) ?: @"";
+    return ![className isEqualToString:@"UIView"];
+}
+
 static BOOL ASSignatureTextMatches(NSString *recorded, NSString *current) {
     // 文案可能因为倒计时或前后缀变化而略有不同，因此允许包含关系，
     // 但不接受过短的单字符特征。
@@ -1245,9 +1263,11 @@ static BOOL gASWatchActive = NO;
                                depth:(NSInteger)depth
                               budget:(NSInteger *)budget
                              results:(NSMutableArray<UIView *> *)results {
-    // 只收集有文字、可点击控件或点击手势的节点；普通布局容器不显示
-    // 绿色框，避免候选数量过多。子视图仍继续遍历，以便找到真正的按钮。
-    if (!view || !window || depth > 32 || !budget || *budget <= 0) return;
+    // 既收集明确的 UIKit 点击节点，也收集有文字、无障碍信息和小型
+    // 自绘叶节点。广告经常把关闭、音量等按钮画在普通 UIView 或
+    // UIImageView 上，不能只依赖 UIControl 和 UITapGestureRecognizer。
+    // 广告页面的包装层经常很深；录制阶段允许更深的树和更大的预算。
+    if (!view || !window || depth > 48 || !budget || *budget <= 0) return;
     (*budget)--;
     if (view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) return;
 
@@ -1256,10 +1276,16 @@ static BOOL gASWatchActive = NO;
 
     BOOL tappable = view != window && ASViewIsTappable(view);
     NSString *directText = ASTextOfView(view);
+    BOOL hasAccessibility = view != window &&
+        (view.isAccessibilityElement ||
+         view.accessibilityLabel.length > 0 ||
+         view.accessibilityIdentifier.length > 0);
+    BOOL visualLeaf = view != window && ASViewLooksLikeVisualLeaf(view);
     UIView *candidate = view;
-    if (directText.length > 0 && !tappable) {
-        // 文字通常挂在按钮内部；如果父级有点击能力，框选父级比只框
-        // UILabel 更准确。没有可点击父级时仍保留文字节点作为可点击候选。
+    if ((directText.length > 0 || hasAccessibility || visualLeaf) && !tappable) {
+        // 文字、无障碍元素和图标通常挂在按钮内部；如果父级有点击
+        // 能力，框选父级比只框子视图更准确。没有可点击父级时，
+        // 仍保留当前节点作为候选，保证自绘广告不被完全漏掉。
         UIView *parent = view.superview;
         for (NSInteger level = 0; level < 6 && parent && parent != window; level++) {
             if (ASViewIsTappable(parent)) {
@@ -1273,28 +1299,43 @@ static BOOL gASWatchActive = NO;
     if (candidate != window && ![results containsObject:candidate]) {
         CGRect candidateRect = [candidate convertRect:candidate.bounds toView:window];
         CGSize windowSize = window.bounds.size;
-        BOOL reasonableSize = candidateRect.size.width >= 12.0 &&
-            candidateRect.size.height >= 12.0 &&
-            candidateRect.size.width <= windowSize.width * 0.72 &&
-            candidateRect.size.height <= windowSize.height * 0.22;
+        BOOL minimumSize = candidateRect.size.width >= 8.0 &&
+            candidateRect.size.height >= 8.0;
+        BOOL ordinarySize = candidateRect.size.width <= windowSize.width * 0.78 &&
+            candidateRect.size.height <= windowSize.height * 0.30;
         NSString *candidateDirectText = ASTextOfView(candidate);
-        BOOL useful = ASViewIsTappable(candidate) || candidateDirectText.length > 0 ||
-            candidate.accessibilityLabel.length > 0;
+        BOOL candidateVisualLeaf = ASViewLooksLikeVisualLeaf(candidate);
+        BOOL candidateHasAccessibility = candidate.isAccessibilityElement ||
+            candidate.accessibilityLabel.length > 0 ||
+            candidate.accessibilityIdentifier.length > 0;
+        BOOL useful = ASViewIsTappable(candidate) ||
+            candidateDirectText.length > 0 ||
+            candidateHasAccessibility ||
+            candidateVisualLeaf;
         BOOL genericButMeaningful = ASViewIsTappable(candidate) ||
             candidateDirectText.length > 0 ||
-            candidate.accessibilityLabel.length > 0;
+            candidateHasAccessibility ||
+            candidateVisualLeaf;
+        // 部分广告把整块卡片作为一个 UIControl，允许这类可交互大节点
+        // 进入候选，避免被旧的 72%/22% 尺寸限制直接过滤。
+        BOOL largeInteractive = ASViewIsTappable(candidate) &&
+            candidateRect.size.width <= windowSize.width * 0.96 &&
+            candidateRect.size.height <= windowSize.height * 0.70;
+        BOOL reasonableSize = minimumSize && (ordinarySize || largeInteractive);
         if (reasonableSize && useful && (!ASIsGenericViewClass(candidate) || genericButMeaningful)) {
             [results addObject:candidate];
         }
     }
 
+    // 录制界面需要尽量完整地展示当前树。这里不能因为前面先遇到
+    // 160 个候选就停止递归，否则深层广告按钮会永远没有机会进入列表。
+    // 由扫描预算负责保护异常页面，最终候选数量再在入口处做安全上限处理。
     for (UIView *subview in view.subviews.reverseObjectEnumerator) {
         [self collectNodeCandidatesFromView:subview
                                    inWindow:window
                                       depth:depth + 1
                                      budget:budget
                                     results:results];
-        if (results.count >= 80) break;
     }
 }
 
@@ -3441,12 +3482,32 @@ static BOOL gASWatchActive = NO;
     [root addSubview:overlay];
 
     NSMutableArray<UIView *> *candidates = [NSMutableArray array];
-    NSInteger budget = 6000;
+    // 录制阶段优先完整收集，避免复杂广告层级在前 160 个候选处被截断。
+    // 预算只限制遍历节点数，不限制候选数量；普通页面通常远低于这个值。
+    NSInteger budget = 24000;
     [self collectNodeCandidatesFromView:host
                                inWindow:host
                                   depth:0
                                  budget:&budget
                                 results:candidates];
+    // 极端页面可能产生大量候选，保留足够大的安全上限，避免创建过多
+    // 覆盖按钮导致录制层卡顿。排序后优先保留可点击、有文字和更具体的节点。
+    if (candidates.count > 480) {
+        [candidates sortUsingComparator:^NSComparisonResult(UIView *first, UIView *second) {
+            BOOL firstTappable = ASViewIsTappable(first);
+            BOOL secondTappable = ASViewIsTappable(second);
+            if (firstTappable != secondTappable) return firstTappable ? NSOrderedAscending : NSOrderedDescending;
+            BOOL firstHasText = ASTextOfView(first).length > 0 || first.accessibilityLabel.length > 0;
+            BOOL secondHasText = ASTextOfView(second).length > 0 || second.accessibilityLabel.length > 0;
+            if (firstHasText != secondHasText) return firstHasText ? NSOrderedAscending : NSOrderedDescending;
+            CGRect firstRect = [first convertRect:first.bounds toView:host];
+            CGRect secondRect = [second convertRect:second.bounds toView:host];
+            CGFloat firstArea = firstRect.size.width * firstRect.size.height;
+            CGFloat secondArea = secondRect.size.width * secondRect.size.height;
+            return firstArea < secondArea ? NSOrderedAscending : (firstArea > secondArea ? NSOrderedDescending : NSOrderedSame);
+        }];
+        [candidates removeObjectsInRange:NSMakeRange(480, candidates.count - 480)];
+    }
     [candidates sortUsingComparator:^NSComparisonResult(UIView *first, UIView *second) {
         BOOL firstTappable = ASViewIsTappable(first);
         BOOL secondTappable = ASViewIsTappable(second);
@@ -3473,12 +3534,52 @@ static BOOL gASWatchActive = NO;
         [self presentSettingsInWindow:host];
         return;
     }
+    [self appendTemplateDebugLog:[NSString stringWithFormat:
+        @"节点录制扫描 window=%@ candidates=%lu remainingBudget=%ld",
+        NSStringFromClass([host class]),
+        (unsigned long)candidates.count,
+        (long)budget]];
+    [candidates enumerateObjectsUsingBlock:^(UIView *node, NSUInteger index, BOOL *stop) {
+        CGRect rect = [node convertRect:node.bounds toView:host];
+        NSString *text = ASTextOfView(node);
+        NSString *accessibility = node.accessibilityLabel.length > 0
+            ? node.accessibilityLabel : node.accessibilityIdentifier;
+        [self appendTemplateDebugLog:[NSString stringWithFormat:
+            @"节点候选 index=%lu class=%@ text='%@' accessibility='%@' rect=%@ tappable=%@ visualLeaf=%@",
+            (unsigned long)(index + 1),
+            NSStringFromClass([node class]),
+            text ?: @"",
+            accessibility ?: @"",
+            NSStringFromCGRect(rect),
+            ASViewIsTappable(node) ? @"YES" : @"NO",
+            ASViewLooksLikeVisualLeaf(node) ? @"YES" : @"NO"]];
+    }];
     self.nodeHostWindow = host;
     self.nodeCandidateViews = candidates;
     self.nodeCandidateButtons = [NSMutableArray array];
 
     UIColor *nodeColor = [UIColor colorWithRed:0.22 green:0.92 blue:0.46 alpha:1.0];
-    [candidates enumerateObjectsUsingBlock:^(UIView *node, NSUInteger index, BOOL *stop) {
+    // 候选数组为了让编号稳定仍按“可点击、文字、小面积”排序，
+    // 但绘制时反过来先放大框、再放小框。这样嵌套节点不会被大容器
+    // 的半透明按钮盖住，用户点击时也会优先命中更具体的小节点。
+    NSArray<UIView *> *drawOrder = [candidates sortedArrayUsingComparator:^NSComparisonResult(UIView *first, UIView *second) {
+        CGRect firstRect = [first convertRect:first.bounds toView:host];
+        CGRect secondRect = [second convertRect:second.bounds toView:host];
+        CGFloat firstArea = firstRect.size.width * firstRect.size.height;
+        CGFloat secondArea = secondRect.size.width * secondRect.size.height;
+        if (fabs(firstArea - secondArea) > 1.0) {
+            return firstArea > secondArea ? NSOrderedAscending : NSOrderedDescending;
+        }
+        BOOL firstTappable = ASViewIsTappable(first);
+        BOOL secondTappable = ASViewIsTappable(second);
+        if (firstTappable != secondTappable) {
+            return firstTappable ? NSOrderedDescending : NSOrderedAscending;
+        }
+        return NSOrderedSame;
+    }];
+    [drawOrder enumerateObjectsUsingBlock:^(UIView *node, NSUInteger drawIndex, BOOL *stop) {
+        NSUInteger index = [candidates indexOfObjectIdenticalTo:node];
+        if (index == NSNotFound) return;
         CGRect hostRect = [node convertRect:node.bounds toView:host];
         CGPoint screenMin = ASScreenPointFromView(host, CGPointMake(CGRectGetMinX(hostRect), CGRectGetMinY(hostRect)));
         CGPoint screenMax = ASScreenPointFromView(host, CGPointMake(CGRectGetMaxX(hostRect), CGRectGetMaxY(hostRect)));
@@ -3521,7 +3622,7 @@ static BOOL gASWatchActive = NO;
     icon.contentMode = UIViewContentModeCenter;
     icon.preferredSymbolConfiguration = [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightSemibold];
     [icon setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
-    UILabel *title = [self labelWithText:@"点击绿色框选择节点 · 数字是候选序号" size:13 weight:UIFontWeightSemibold alpha:1.0];
+    UILabel *title = [self labelWithText:@"点击绿色框选择节点 · 数字是候选序号 · 可拖动" size:13 weight:UIFontWeightSemibold alpha:1.0];
     title.numberOfLines = 1;
     title.adjustsFontSizeToFitWidth = YES;
     title.minimumScaleFactor = 0.8;
@@ -3554,11 +3655,54 @@ static BOOL gASWatchActive = NO;
         [content.trailingAnchor constraintEqualToAnchor:card.contentView.trailingAnchor constant:-7],
     ]];
 
+    // 提示卡片是浮动工具条：用户可以把它拖到不遮挡目标节点的位置。
+    UIPanGestureRecognizer *cardPan = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onNodePickerCardPan:)];
+    cardPan.maximumNumberOfTouches = 1;
+    // 拖动只负责移动卡片，不吞掉卡片内按钮的点击事件。
+    cardPan.cancelsTouchesInView = NO;
+    [card addGestureRecognizer:cardPan];
+
+    // 提示卡片不能遮住候选框：广告底部的按钮经常正好落在安全区附近。
+    // 将候选按钮重新置顶，仍保留取消按钮在最上层，保证提示可关闭。
+    for (UIButton *candidateButton in self.nodeCandidateButtons) {
+        [overlay bringSubviewToFront:candidateButton];
+    }
+    [overlay bringSubviewToFront:cancel];
+
     self.pickOverlay = overlay;
     overlay.alpha = 0;
     [UIView animateWithDuration:0.25 animations:^{
         overlay.alpha = 1;
     }];
+}
+
+- (void)onNodePickerCardPan:(UIPanGestureRecognizer *)pan {
+    UIView *card = pan.view;
+    UIView *container = card.superview;
+    if (!card || !container) return;
+
+    CGPoint delta = [pan translationInView:container];
+    if (delta.x == 0 && delta.y == 0) return;
+    card.transform = CGAffineTransformTranslate(card.transform, delta.x, delta.y);
+    [pan setTranslation:CGPointZero inView:container];
+
+    // 保证卡片始终留在可见区域内，方便下一次继续拖动或点击取消。
+    CGRect frame = [card convertRect:card.bounds toView:container];
+    CGFloat margin = 8.0;
+    CGFloat dx = 0.0;
+    CGFloat dy = 0.0;
+    if (CGRectGetMinX(frame) < margin) dx = margin - CGRectGetMinX(frame);
+    if (CGRectGetMaxX(frame) > CGRectGetWidth(container.bounds) - margin) {
+        dx = CGRectGetWidth(container.bounds) - margin - CGRectGetMaxX(frame);
+    }
+    if (CGRectGetMinY(frame) < margin) dy = margin - CGRectGetMinY(frame);
+    if (CGRectGetMaxY(frame) > CGRectGetHeight(container.bounds) - margin) {
+        dy = CGRectGetHeight(container.bounds) - margin - CGRectGetMaxY(frame);
+    }
+    if (dx != 0.0 || dy != 0.0) {
+        card.transform = CGAffineTransformTranslate(card.transform, dx, dy);
+    }
 }
 
 - (void)onNodeCandidateTap:(UIButton *)button {
