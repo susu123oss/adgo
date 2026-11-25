@@ -3,7 +3,7 @@ Name: 开屏广告走开
 Depends: mobilesubstrate
 Conflicts: com.ios.adskip
 Replaces: com.ios.adskip
-Version: 0.0.5
+Version: 0.0.6
 Architecture: iphoneos-arm64
 Description: 基于视图节点和开屏“跳过”文字识别的广告自动跳过插件
 Maintainer: Developer

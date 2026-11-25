@@ -48,7 +48,7 @@ static const CGFloat kASTemplateMinimumSize = 24.0;
 static const CGFloat kASTemplateMaximumFraction = 0.45;
 static const CGFloat kASTemplateSearchRadius = 120.0;
 static const CGFloat kASTemplateMatchThreshold = 0.58;
-static NSString *const kASVersion = @"0.0.5";
+static NSString *const kASVersion = @"0.0.6";
 // 在线更新只读取 GitHub Tag，不下载或替换当前已经加载的动态库。
 static NSString *const kASUpdateCheckDateDefaultsKey = @"SplashAway.updateCheckDate";
 static NSString *const kASUpdateLatestTagDefaultsKey = @"SplashAway.updateLatestTag";

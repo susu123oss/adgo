@@ -44,7 +44,7 @@ flowchart LR
 
 ### 侧载注入
 
-1. 从 [v0.0.5 Release](https://github.com/susu123oss/adgo/releases/tag/v0.0.5) 下载 `SplashAway.dylib`。
+1. 从 [v0.0.6 Release](https://github.com/susu123oss/adgo/releases/tag/v0.0.6) 下载 `SplashAway.dylib`。
 2. 注入目标 App 前，先移除旧的 `AdSkip.dylib`、`SplashAway.dylib` 或 `广告走开.dylib`，避免多个版本同时加载。
 3. 注入后彻底结束目标 App，再重新打开。
 4. 通过启动提示或三指长按进入设置，确认插件已经加载。
