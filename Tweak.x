@@ -27,6 +27,7 @@
 static const NSInteger kASOwnViewTag = 0x0A5C1F;
 static const NSTimeInterval kASSessionDuration = 12.0;
 static const NSInteger kASScanNodeBudget = 4000;
+static const NSInteger kASNodeRecordingBudget = 24000;
 static char kASGestureInstalledKey;
 static NSString *const kASPointsDefaultsKey = @"SplashAway.customPoints";
 static NSString *const kASSkipCountDefaultsKey = @"SplashAway.skipCount";
@@ -41,6 +42,7 @@ static const NSTimeInterval kASPointWatchInterval = 0.5;
 static const NSTimeInterval kASWatchBurstDuration = 6.0;
 static const NSTimeInterval kASStartupSkipInitialDelay = 1.0;
 static const NSTimeInterval kASStartupSkipInterval = 0.5;
+static const NSTimeInterval kASStartupSkipRetryDelay = 1.0;
 static const NSTimeInterval kASPointCooldown = 4.0;
 static const CGFloat kASTemplateMinimumSize = 24.0;
 static const CGFloat kASTemplateMaximumFraction = 0.45;
@@ -263,6 +265,24 @@ static BOOL ASViewIsTappable(UIView *view) {
     return NO;
 }
 
+static BOOL ASNodeSizeIsEligible(CGSize size, CGSize windowSize, BOOL tappable) {
+    if (size.width < 8.0 || size.height < 8.0) return NO;
+    if (tappable) {
+        return size.width <= windowSize.width * 0.96 && size.height <= windowSize.height * 0.70;
+    }
+    return size.width <= windowSize.width * 0.90 && size.height <= windowSize.height * 0.32;
+}
+
+static CGRect ASVisibleNodeRect(UIView *view, UIWindow *window, CGRect rect) {
+    rect = CGRectIntersection(rect, window.bounds);
+    for (UIView *parent = view.superview; parent && parent != window && !CGRectIsEmpty(rect); parent = parent.superview) {
+        if (parent.clipsToBounds) {
+            rect = CGRectIntersection(rect, [parent convertRect:parent.bounds toView:window]);
+        }
+    }
+    return rect;
+}
+
 static NSString *ASStringValueFromObject(id value) {
     if ([value isKindOfClass:[NSString class]]) return value;
     if ([value isKindOfClass:[NSAttributedString class]]) return [value string];
@@ -446,6 +466,16 @@ static NSArray<UIWindow *> *ASVisibleWindows(void) {
     }];
 }
 
+static NSArray<UIWindow *> *ASVisibleWindowsInScene(UIWindow *host) {
+    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
+    for (UIWindow *window in ASVisibleWindows()) {
+        if (window.windowScene == host.windowScene && window.screen == host.screen) {
+            [windows addObject:window];
+        }
+    }
+    return windows;
+}
+
 static UIViewController *ASTopViewController(UIWindow *window) {
     UIViewController *controller = window.rootViewController;
     while (controller.presentedViewController && !controller.presentedViewController.isBeingDismissed) {
@@ -470,6 +500,18 @@ static CGPoint ASViewPointFromScreen(UIView *view, CGPoint screenPoint) {
     // 点击宿主视图前，把持久化的屏幕坐标转换回目标窗口坐标。
     if (!view) return screenPoint;
     return [view convertPoint:screenPoint fromCoordinateSpace:ASScreenSpaceForView(view)];
+}
+
+static UIView *ASFrontmostHitInWindow(UIWindow *targetWindow, CGPoint point, NSArray<UIWindow *> *windows) {
+    CGPoint screenPoint = ASScreenPointFromView(targetWindow, point);
+    for (UIWindow *window in windows) {
+        if (window.windowScene != targetWindow.windowScene || window.screen != targetWindow.screen) continue;
+        CGPoint localPoint = window == targetWindow ? point : ASViewPointFromScreen(window, screenPoint);
+        UIView *hit = [window hitTest:localPoint withEvent:nil];
+        if (hit && hit != window && hit.tag != kASOwnViewTag) return window == targetWindow ? hit : nil;
+        if (window == targetWindow) break;
+    }
+    return nil;
 }
 
 static BOOL ASIsUsableScreenPoint(CGPoint point) {
@@ -810,11 +852,17 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 
 #pragma mark - 引擎
 
+typedef NS_ENUM(NSInteger, ASNodeActivationResult) {
+    ASNodeNotFound,
+    ASNodeActivationFailed,
+    ASNodeActivated,
+};
+
 @interface SplashAwayEngine : NSObject <UIGestureRecognizerDelegate>
 // 会话状态：启动/回前台后只在有限时长内进行高频扫描。
 @property (nonatomic, assign) BOOL isMonitoring;
 @property (nonatomic, assign) BOOL hasTriggered;
-@property (nonatomic, assign) CFAbsoluteTime sessionStart;
+@property (nonatomic, assign) NSTimeInterval startupScanDeadline;
 @property (nonatomic, assign) CFAbsoluteTime lastActivation;
 @property (nonatomic, strong) dispatch_source_t scanTimer;
 // 自定义坐标和对应控件特征按相同下标配对保存。
@@ -823,7 +871,7 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *pointLastTap;
 @property (nonatomic, strong) NSHashTable<UIView *> *pointTappedViews;
 @property (nonatomic, strong) dispatch_source_t pointTimer;
-@property (nonatomic, strong) NSHashTable<UIView *> *failedViews;
+@property (nonatomic, strong) NSMapTable<UIView *, NSNumber *> *startupRetryTimes;
 // 下面这些视图属于插件自己的 UI 或已处理对象，扫描时必须跳过。
 @property (nonatomic, strong) UIView *pickOverlay;
 @property (nonatomic, strong) UIView *pickDimView;
@@ -833,9 +881,7 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 @property (nonatomic, assign) CGRect pickSelectionRect;
 @property (nonatomic, weak) UILabel *pickSizeLabel;
 // 节点选择模式使用独立的候选节点数组，避免和截图选框共用临时状态。
-@property (nonatomic, weak) UIWindow *nodeHostWindow;
 @property (nonatomic, strong) NSMutableArray<UIView *> *nodeCandidateViews;
-@property (nonatomic, strong) NSMutableArray<UIButton *> *nodeCandidateButtons;
 @property (nonatomic, strong) UIImage *pendingCaptureImage;
 @property (nonatomic, assign) CGRect pendingCaptureHostRect;
 @property (nonatomic, assign) CGRect pendingCaptureScreenRect;
@@ -879,6 +925,7 @@ static BOOL ASSynthesizeTap(UIWindow *window, UIView *view, CGPoint point) {
 - (void)stopPointWatcher;
 - (void)wakeWatchBurstWithDuration:(NSTimeInterval)duration;
 - (void)scanStartupSkip;
+- (BOOL)activateView:(UIView *)view inWindow:(UIWindow *)window allowLargeTarget:(BOOL)allowLargeTarget;
 - (UIView *)findStartupSkipInView:(UIView *)view
                          inWindow:(UIWindow *)window
                             depth:(NSInteger)depth
@@ -912,12 +959,11 @@ static BOOL gASWatchActive = NO;
         _customSignatures = [NSMutableArray array];
         _pickSelectionHandles = [NSMutableArray array];
         _nodeCandidateViews = [NSMutableArray array];
-        _nodeCandidateButtons = [NSMutableArray array];
         _selectedPointIndexes = [NSMutableIndexSet indexSet];
         _pointMarkerButtons = [NSMutableArray array];
         _pointLastTap = [NSMutableDictionary dictionary];
         _pointTappedViews = [NSHashTable weakObjectsHashTable];
-        _failedViews = [NSHashTable weakObjectsHashTable];
+        _startupRetryTimes = [NSMapTable weakToStrongObjectsMapTable];
         _handledPopups = [NSHashTable weakObjectsHashTable];
         _freshRoots = [NSHashTable weakObjectsHashTable];
         [self loadCustomPoints];
@@ -1233,27 +1279,19 @@ static BOOL gASWatchActive = NO;
     // 节点录制直接使用用户点选的候选视图，避免再次通过 HUD 的坐标
     // hitTest 反推目标；保存的坐标只作为节点搜索的距离参考。
     if (!node || !window || node == window) return @{};
-    UIView *tappableAncestor = ASNearestTappableAncestor(node, window);
-    UIView *signatureNode = tappableAncestor ?: node;
-    CGRect rect = [signatureNode convertRect:signatureNode.bounds toView:window];
-    if (CGRectIsEmpty(rect)) return @{};
+    CGRect rect = [node convertRect:node.bounds toView:window];
+    if (!ASNodeSizeIsEligible(rect.size, window.bounds.size, ASViewIsTappable(node))) return @{};
 
     NSMutableDictionary *signature = [NSMutableDictionary dictionary];
     signature[@"type"] = @"viewNode";
-    signature[@"cls"] = NSStringFromClass([signatureNode class]) ?: @"";
+    signature[@"cls"] = NSStringFromClass([node class]) ?: @"";
     signature[@"size"] = NSStringFromCGSize(rect.size);
     NSString *text = ASTextOfView(node);
-    if (text.length == 0) text = ASSignatureTextOfView(signatureNode, window);
+    if (text.length == 0) text = ASSignatureTextOfView(node, window);
     if (text.length > 0) signature[@"text"] = text;
-    NSString *accessibility = signatureNode.accessibilityIdentifier.length > 0
-        ? signatureNode.accessibilityIdentifier : node.accessibilityIdentifier;
+    NSString *accessibility = node.accessibilityIdentifier;
     if (accessibility.length > 0) {
         signature[@"accessibility"] = accessibility;
-    }
-    if (signatureNode != node) {
-        signature[@"sourceClass"] = NSStringFromClass([node class]) ?: @"";
-        NSString *sourceText = ASTextOfView(node);
-        if (sourceText.length > 0) signature[@"sourceText"] = sourceText;
     }
     return signature;
 }
@@ -1262,7 +1300,7 @@ static BOOL gASWatchActive = NO;
                             inWindow:(UIWindow *)window
                                depth:(NSInteger)depth
                               budget:(NSInteger *)budget
-                             results:(NSMutableArray<UIView *> *)results {
+                             results:(NSMutableOrderedSet<UIView *> *)results {
     // 既收集明确的 UIKit 点击节点，也收集有文字、无障碍信息和小型
     // 自绘叶节点。广告经常把关闭、音量等按钮画在普通 UIView 或
     // UIImageView 上，不能只依赖 UIControl 和 UITapGestureRecognizer。
@@ -1272,7 +1310,8 @@ static BOOL gASWatchActive = NO;
     if (view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) return;
 
     CGRect rect = (view == window) ? window.bounds : [view convertRect:view.bounds toView:window];
-    if (CGRectIsEmpty(rect) || !CGRectIntersectsRect(rect, window.bounds)) return;
+    BOOL intersectsWindow = CGRectIntersectsRect(rect, window.bounds);
+    if (!intersectsWindow && view.clipsToBounds) return;
 
     BOOL tappable = view != window && ASViewIsTappable(view);
     NSString *directText = ASTextOfView(view);
@@ -1281,48 +1320,18 @@ static BOOL gASWatchActive = NO;
          view.accessibilityLabel.length > 0 ||
          view.accessibilityIdentifier.length > 0);
     BOOL visualLeaf = view != window && ASViewLooksLikeVisualLeaf(view);
-    UIView *candidate = view;
-    if ((directText.length > 0 || hasAccessibility || visualLeaf) && !tappable) {
-        // 文字、无障碍元素和图标通常挂在按钮内部；如果父级有点击
-        // 能力，框选父级比只框子视图更准确。没有可点击父级时，
-        // 仍保留当前节点作为候选，保证自绘广告不被完全漏掉。
-        UIView *parent = view.superview;
-        for (NSInteger level = 0; level < 6 && parent && parent != window; level++) {
-            if (ASViewIsTappable(parent)) {
-                candidate = parent;
-                break;
+    if (view != window && intersectsWindow && (tappable || directText.length > 0 || hasAccessibility || visualLeaf)) {
+        UIView *candidate = view;
+        if (!tappable) {
+            UIView *parent = ASNearestTappableAncestor(view, window);
+            if (parent) {
+                CGRect parentRect = [parent convertRect:parent.bounds toView:window];
+                if (ASNodeSizeIsEligible(parentRect.size, window.bounds.size, YES)) candidate = parent;
             }
-            parent = parent.superview;
         }
-    }
-
-    if (candidate != window && ![results containsObject:candidate]) {
-        CGRect candidateRect = [candidate convertRect:candidate.bounds toView:window];
-        CGSize windowSize = window.bounds.size;
-        BOOL minimumSize = candidateRect.size.width >= 8.0 &&
-            candidateRect.size.height >= 8.0;
-        BOOL ordinarySize = candidateRect.size.width <= windowSize.width * 0.78 &&
-            candidateRect.size.height <= windowSize.height * 0.30;
-        NSString *candidateDirectText = ASTextOfView(candidate);
-        BOOL candidateVisualLeaf = ASViewLooksLikeVisualLeaf(candidate);
-        BOOL candidateHasAccessibility = candidate.isAccessibilityElement ||
-            candidate.accessibilityLabel.length > 0 ||
-            candidate.accessibilityIdentifier.length > 0;
-        BOOL useful = ASViewIsTappable(candidate) ||
-            candidateDirectText.length > 0 ||
-            candidateHasAccessibility ||
-            candidateVisualLeaf;
-        BOOL genericButMeaningful = ASViewIsTappable(candidate) ||
-            candidateDirectText.length > 0 ||
-            candidateHasAccessibility ||
-            candidateVisualLeaf;
-        // 部分广告把整块卡片作为一个 UIControl，允许这类可交互大节点
-        // 进入候选，避免被旧的 72%/22% 尺寸限制直接过滤。
-        BOOL largeInteractive = ASViewIsTappable(candidate) &&
-            candidateRect.size.width <= windowSize.width * 0.96 &&
-            candidateRect.size.height <= windowSize.height * 0.70;
-        BOOL reasonableSize = minimumSize && (ordinarySize || largeInteractive);
-        if (reasonableSize && useful && (!ASIsGenericViewClass(candidate) || genericButMeaningful)) {
+        CGRect candidateRect = candidate == view ? rect : [candidate convertRect:candidate.bounds toView:window];
+        if (ASNodeSizeIsEligible(candidateRect.size, window.bounds.size, candidate != view || tappable) &&
+            !CGRectIsEmpty(ASVisibleNodeRect(candidate, window, candidateRect))) {
             [results addObject:candidate];
         }
     }
@@ -1390,7 +1399,7 @@ static BOOL gASWatchActive = NO;
 
     if (self.popupOn) [self dismissPopupsInWindows:windows];
 
-    [self watchSignedPoints];
+    [self watchSignedPointsInWindows:ASVisibleWindows()];
 }
 
 - (void)updatePointWatcher {
@@ -1402,7 +1411,11 @@ static BOOL gASWatchActive = NO;
     }
 }
 
-- (BOOL)view:(UIView *)anchor inWindow:(UIWindow *)window matchesSignature:(NSDictionary *)signature {
+- (BOOL)view:(UIView *)anchor
+    inWindow:(UIWindow *)window
+        size:(CGSize)size
+matchesSignature:(NSDictionary *)signature
+       score:(CGFloat *)score {
     // 文本签名优先级高于类名和尺寸；没有文本时才要求类名一致，
     // 并允许尺寸有小幅变化以适应不同字体和布局。
     NSString *recordedAccessibility = [signature[@"accessibility"] isKindOfClass:[NSString class]]
@@ -1411,17 +1424,26 @@ static BOOL gASWatchActive = NO;
         ![recordedAccessibility isEqualToString:anchor.accessibilityIdentifier ?: @""]) {
         return NO;
     }
+    NSString *recordedClass = [signature[@"cls"] isKindOfClass:[NSString class]] ? signature[@"cls"] : @"";
+    BOOL sameClass = [recordedClass isEqualToString:NSStringFromClass([anchor class])];
+    *score = sameClass ? 250.0 : 0.0;
     NSString *recordedText = [signature[@"text"] isKindOfClass:[NSString class]] ? signature[@"text"] : @"";
     if (recordedText.length > 0) {
-        return ASSignatureTextMatches(recordedText, ASSignatureTextOfView(anchor, window));
+        NSString *directText = ASTextOfView(anchor);
+        if ([recordedText isEqualToString:directText]) {
+            *score += 450.0;
+            return YES;
+        }
+        NSString *currentText = ASSignatureTextOfView(anchor, window);
+        if (!ASSignatureTextMatches(recordedText, currentText)) return NO;
+        *score += [recordedText isEqualToString:currentText] ? 450.0 : 250.0;
+        return YES;
     }
-    NSString *recordedClass = [signature[@"cls"] isKindOfClass:[NSString class]] ? signature[@"cls"] : @"";
-    if (recordedClass.length == 0 || ![recordedClass isEqualToString:NSStringFromClass([anchor class])]) return NO;
+    if (!sameClass) return NO;
     if (ASIsGenericViewClass(anchor) &&
         ![signature[@"type"] isEqualToString:@"viewNode"]) return NO;
     if ([signature[@"size"] isKindOfClass:[NSString class]]) {
         CGSize recordedSize = CGSizeFromString(signature[@"size"]);
-        CGSize size = [anchor convertRect:anchor.bounds toView:window].size;
         if (fabs(size.width - recordedSize.width) > MAX(8, recordedSize.width * 0.2) ||
             fabs(size.height - recordedSize.height) > MAX(8, recordedSize.height * 0.2)) return NO;
     }
@@ -1430,7 +1452,8 @@ static BOOL gASWatchActive = NO;
 
 - (UIView *)findNodeMatchingSignature:(NSDictionary *)signature
                              inWindow:(UIWindow *)window
-                      nearScreenPoint:(CGPoint)screenPoint {
+                      nearScreenPoint:(CGPoint)screenPoint
+                             outScore:(CGFloat *)outScore {
     // 节点模式不再只检查录制坐标下的 hitTest，而是遍历当前视图树，
     // 从所有匹配签名的节点中选择距离录制位置最近的一个。
     if (!signature.count || !window) return nil;
@@ -1446,43 +1469,29 @@ static BOOL gASWatchActive = NO;
         if (!view || view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) continue;
 
         CGRect rect = (view == window) ? window.bounds : [view convertRect:view.bounds toView:window];
-        if (CGRectIsEmpty(rect) || !CGRectIntersectsRect(rect, window.bounds)) continue;
-        if (view != window && [self view:view inWindow:window matchesSignature:signature]) {
-            CGSize windowSize = window.bounds.size;
-            BOOL reasonableSize = rect.size.width >= 12.0 &&
-                rect.size.height >= 12.0 &&
-                rect.size.width <= windowSize.width * 0.9 &&
-                rect.size.height <= windowSize.height * 0.32;
-            if (reasonableSize) {
-                CGPoint center = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
-                CGFloat distance = hypot(center.x - referencePoint.x, center.y - referencePoint.y);
-                NSString *recordedText = [signature[@"text"] isKindOfClass:[NSString class]]
-                    ? signature[@"text"] : @"";
-                NSString *currentText = ASSignatureTextOfView(view, window);
-                NSString *recordedClass = [signature[@"cls"] isKindOfClass:[NSString class]]
-                    ? signature[@"cls"] : @"";
-                CGFloat score = 0;
-                if (recordedClass.length > 0 &&
-                    [recordedClass isEqualToString:NSStringFromClass([view class])]) {
-                    score += 250.0;
-                }
-                if (recordedText.length > 0 && currentText.length > 0) {
-                    if ([recordedText isEqualToString:currentText]) {
-                        score += 450.0;
-                    } else {
-                        score += 250.0;
+        BOOL intersectsWindow = CGRectIntersectsRect(rect, window.bounds);
+        if (!intersectsWindow && view.clipsToBounds) continue;
+        if (view != window && intersectsWindow) {
+            BOOL tappable = ASViewIsTappable(view);
+            CGFloat score = 0.0;
+            if (ASNodeSizeIsEligible(rect.size, window.bounds.size, tappable) &&
+                [self view:view inWindow:window size:rect.size matchesSignature:signature score:&score]) {
+                CGRect visibleRect = ASVisibleNodeRect(view, window, rect);
+                if (!CGRectIsEmpty(visibleRect)) {
+                    CGFloat distance = hypot(CGRectGetMidX(visibleRect) - referencePoint.x,
+                                             CGRectGetMidY(visibleRect) - referencePoint.y);
+                    if (tappable) score += 180.0;
+                    score -= MIN(distance, 800.0) * 0.45;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = view;
                     }
-                }
-                if (ASViewIsTappable(view)) score += 180.0;
-                score -= MIN(distance, 800.0) * 0.45;
-                if (score > bestScore) {
-                    bestScore = score;
-                    best = view;
                 }
             }
         }
         [stack addObjectsFromArray:view.subviews];
     }
+    *outScore = bestScore;
     return best;
 }
 
@@ -1768,82 +1777,81 @@ static BOOL gASWatchActive = NO;
                            outScore:NULL];
 }
 
-- (void)watchSignedPoints {
-    // 全程监听只检查用户明确保存的视图节点。
-    // 截图模板保留给手动测试，不参与自动开屏跳过，避免任何图像或坐标兜底误触。
-    // 必须同时满足：应用活跃、面板未打开、冷却已结束。
+- (ASNodeActivationResult)activateSavedNode:(NSDictionary *)signature
+                              screenPoint:(CGPoint)screenPoint
+                                  windows:(NSArray<UIWindow *> *)windows
+                                    index:(NSUInteger)index
+                                automatic:(BOOL)automatic {
+    UIView *best = nil;
+    CGFloat bestScore = -CGFLOAT_MAX;
+    for (UIWindow *window in windows) {
+        CGFloat score = -CGFLOAT_MAX;
+        UIView *anchor = [self findNodeMatchingSignature:signature
+                                               inWindow:window
+                                        nearScreenPoint:screenPoint
+                                               outScore:&score];
+        if (anchor && score > bestScore) {
+            best = anchor;
+            bestScore = score;
+        }
+    }
+    if (!best) {
+        [self appendTemplateDebugLog:[NSString stringWithFormat:
+            @"%@节点未匹配 index=%lu class=%@ text='%@' anchor=(%.1f, %.1f)",
+            automatic ? @"监听" : @"测试", (unsigned long)index,
+            signature[@"cls"] ?: @"", signature[@"text"] ?: @"", screenPoint.x, screenPoint.y]];
+        return ASNodeNotFound;
+    }
+    if (automatic && [self.pointTappedViews containsObject:best]) return ASNodeNotFound;
+    UIWindow *window = best.window;
+    if (!window) return ASNodeActivationFailed;
+
+    CGRect rect = ASVisibleNodeRect(best, window, [best convertRect:best.bounds toView:window]);
+    CGPoint point = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
+    UIView *hit = ASFrontmostHitInWindow(window, point, windows);
+    // 普通文字可能不接收触摸，允许命中它所在的按钮或手势容器。
+    UIView *target = ASNearestTappableAncestor(best, window) ?: best;
+    BOOL reachable = [hit isDescendantOfView:target];
+    BOOL activated = reachable && [self activateView:best inWindow:window allowLargeTarget:YES];
+    [self appendTemplateDebugLog:[NSString stringWithFormat:
+        @"%@节点命中 index=%lu class=%@ text='%@' rect=%@ score=%.1f reachable=%d result=%d",
+        automatic ? @"监听" : @"测试", (unsigned long)index,
+        NSStringFromClass([best class]), signature[@"text"] ?: @"",
+        NSStringFromCGRect(rect), bestScore, reachable, activated]];
+    if (!activated) return ASNodeActivationFailed;
+    if (automatic) {
+        self.pointLastTap[@(index)] = @(CFAbsoluteTimeGetCurrent());
+        [self.pointTappedViews addObject:best];
+        [self recordSkipWithMethod:@"节点匹配"];
+    }
+    [self showTapFeedbackAtPoint:point inWindow:window];
+    return ASNodeActivated;
+}
+
+- (void)watchSignedPointsInWindows:(NSArray<UIWindow *> *)windows {
+    // 全程监听只回放已保存的视图签名。
     if (!self.enabledOn || self.pickOverlay || self.panelView) return;
     UIApplication *app = [UIApplication sharedApplication];
     if (!app || app.applicationState != UIApplicationStateActive) return;
-    NSArray<UIWindow *> *windows = ASVisibleWindows();
     if (windows.count == 0) return;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     NSArray<NSValue *> *points = [self.customPoints copy];
     NSArray<NSDictionary *> *signatures = [self.customSignatures copy];
     for (NSUInteger index = 0; index < points.count; index++) {
         NSDictionary *signature = index < signatures.count ? signatures[index] : @{};
-        if (signature.count == 0) continue;
+        if (signature.count == 0 || [signature[@"templateFile"] isKindOfClass:[NSString class]]) continue;
         NSNumber *last = self.pointLastTap[@(index)];
         if (last && now - last.doubleValue < kASPointCooldown) continue;
-        CGPoint screenPoint = points[index].CGPointValue;
 
-        if ([signature[@"templateFile"] isKindOfClass:[NSString class]]) {
+        ASNodeActivationResult result = [self activateSavedNode:signature
+                                                    screenPoint:points[index].CGPointValue
+                                                        windows:windows
+                                                          index:index
+                                                      automatic:YES];
+        if (result == ASNodeActivated) return;
+        if (result == ASNodeActivationFailed) {
             [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                          @"监听跳过截图模板 index=%lu 原因=自动模式仅使用视图节点",
-                                          (unsigned long)index]];
-            continue;
-        }
-
-        // 节点特征匹配：优先在当前视图树中寻找节点，不再要求
-        // 节点必须恰好位于录制时的固定坐标。
-        BOOL nodeFound = NO;
-        for (UIWindow *window in windows) {
-            if (signature.count > 0) {
-                UIView *anchor = [self findNodeMatchingSignature:signature
-                                                        inWindow:window
-                                                 nearScreenPoint:screenPoint];
-                if (!anchor) continue;
-                nodeFound = YES;
-                if ([self.pointTappedViews containsObject:anchor]) {
-                    [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                                  @"监听节点跳过 index=%lu 原因=节点已成功处理 class=%@",
-                                                  (unsigned long)index, NSStringFromClass([anchor class])]];
-                    continue;
-                }
-                if (![self view:anchor inWindow:window matchesSignature:signature]) continue;
-                CGRect rect = [anchor convertRect:anchor.bounds toView:window];
-                CGPoint point = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
-                NSString *text = ASSignatureTextOfView(anchor, window);
-                BOOL directActivated = [self activateView:anchor inWindow:window];
-                [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                              @"监听节点命中 index=%lu class=%@ text='%@' rect=%@ direct=%d fallback=0 result=%d",
-                                              (unsigned long)index,
-                                              NSStringFromClass([anchor class]),
-                                              text ?: @"",
-                                              NSStringFromCGRect(rect),
-                                              directActivated,
-                                              directActivated]];
-                if (directActivated) {
-                    self.pointLastTap[@(index)] = @(now);
-                    [self.pointTappedViews addObject:anchor];
-                    [self recordSkipWithMethod:@"节点匹配"];
-                    [self showTapFeedbackAtPoint:point inWindow:window];
-                    return;
-                }
-                [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                              @"监听节点点击失败 index=%lu，将在后续监听中重试",
-                                              (unsigned long)index]];
-                break;
-            }
-        }
-        if (!nodeFound) {
-            [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                          @"监听节点未匹配 index=%lu class=%@ text='%@' anchor=(%.1f, %.1f)",
-                                          (unsigned long)index,
-                                          signature[@"cls"] ?: @"",
-                                          signature[@"text"] ?: @"",
-                                          screenPoint.x,
-                                          screenPoint.y]];
+                @"监听节点点击失败 index=%lu，将在后续监听中重试", (unsigned long)index]];
         }
     }
 }
@@ -1877,10 +1885,11 @@ static BOOL gASWatchActive = NO;
     if (view.isHidden || view.alpha < 0.05 || view.tag == kASOwnViewTag) return nil;
 
     CGRect rect = view == window ? window.bounds : [view convertRect:view.bounds toView:window];
-    if (CGRectIsEmpty(rect) || !CGRectIntersectsRect(rect, window.bounds)) return nil;
+    BOOL intersectsWindow = CGRectIntersectsRect(rect, window.bounds);
+    if (!intersectsWindow && view.clipsToBounds) return nil;
 
-    NSString *directText = ASTextOfView(view);
-    if (view != window && ASIsStartupSkipText(directText)) {
+    if (view != window && intersectsWindow && ASIsStartupSkipText(ASTextOfView(view)) &&
+        !CGRectIsEmpty(ASVisibleNodeRect(view, window, rect))) {
         UIView *candidate = ASNearestTappableAncestor(view, window) ?: view;
         CGRect candidateRect = [candidate convertRect:candidate.bounds toView:window];
         CGSize windowSize = window.bounds.size;
@@ -1888,7 +1897,10 @@ static BOOL gASWatchActive = NO;
             candidateRect.size.height >= 12.0 &&
             candidateRect.size.width <= windowSize.width * 0.6 &&
             candidateRect.size.height <= MIN(100.0, windowSize.height * 0.25);
-        if (reasonable && ![self.failedViews containsObject:candidate]) return candidate;
+        NSNumber *retryTime = [self.startupRetryTimes objectForKey:candidate];
+        if (reasonable && (!retryTime || NSProcessInfo.processInfo.systemUptime >= retryTime.doubleValue)) {
+            return candidate;
+        }
     }
 
     for (UIView *subview in view.subviews.reverseObjectEnumerator) {
@@ -1904,12 +1916,19 @@ static BOOL gASWatchActive = NO;
 - (void)scanStartupSkip {
     // 这是启动会话内的严格原生文字扫描，只接受明确的“跳过”语义。
     // 不识别“关闭”、单字母 X 或普通业务里的“跳过推荐”等文案。
-    if (!self.isMonitoring || self.hasTriggered || self.pickOverlay || self.panelView) return;
+    if (!self.isMonitoring || self.hasTriggered) return;
+    if (NSProcessInfo.processInfo.systemUptime >= self.startupScanDeadline) {
+        [self stopSession];
+        [self appendTemplateDebugLog:@"开屏跳过文字扫描超时"];
+        return;
+    }
+    if (self.pickOverlay || self.panelView) return;
     UIApplication *app = [UIApplication sharedApplication];
     if (!app || app.applicationState != UIApplicationStateActive) return;
 
     NSArray<UIWindow *> *windows = ASVisibleWindows();
     if (windows.count == 0) return;
+    BOOL found = NO;
     for (UIWindow *window in windows) {
         NSInteger budget = kASScanNodeBudget;
         UIView *candidate = [self findStartupSkipInView:window
@@ -1917,21 +1936,25 @@ static BOOL gASWatchActive = NO;
                                                   depth:0
                                                  budget:&budget];
         if (!candidate) continue;
+        found = YES;
 
-        CGRect rect = [candidate convertRect:candidate.bounds toView:window];
+        CGRect rect = ASVisibleNodeRect(candidate, window, [candidate convertRect:candidate.bounds toView:window]);
         CGPoint point = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
         NSString *text = ASSignatureTextOfView(candidate, window);
-        BOOL directActivated = [self activateView:candidate inWindow:window];
+        UIView *hit = CGRectIsEmpty(rect) ? nil : ASFrontmostHitInWindow(window, point, windows);
+        BOOL reachable = hit == candidate || [hit isDescendantOfView:candidate];
+        BOOL directActivated = reachable && [self activateView:candidate inWindow:window];
         BOOL coordinateActivated = NO;
-        if (!directActivated) {
-            coordinateActivated = [self activateScreenPoint:ASScreenPointFromView(window, point)];
+        if (reachable && !directActivated) {
+            coordinateActivated = ASSynthesizeTap(window, hit, point);
         }
         BOOL activated = directActivated || coordinateActivated;
         [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                      @"开屏跳过文字命中 class=%@ text='%@' rect=%@ direct=%d coordinate=%d result=%d",
+                                      @"开屏跳过文字命中 class=%@ text='%@' rect=%@ reachable=%d direct=%d coordinate=%d result=%d",
                                       NSStringFromClass([candidate class]),
                                       text ?: @"",
                                       NSStringFromCGRect(rect),
+                                      reachable,
                                       directActivated,
                                       coordinateActivated,
                                       activated]];
@@ -1939,12 +1962,14 @@ static BOOL gASWatchActive = NO;
             [self finishWithFeedbackAtPoint:point inWindow:window method:@"开屏文字识别"];
             return;
         }
-        [self.failedViews addObject:candidate];
+        NSTimeInterval retryTime = NSProcessInfo.processInfo.systemUptime + kASStartupSkipRetryDelay;
+        [self.startupRetryTimes setObject:@(retryTime) forKey:candidate];
         [self appendTemplateDebugLog:@"开屏跳过文字点击失败，将在后续扫描中重试"];
     }
-    [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                  @"开屏跳过文字未匹配 windows=%lu",
-                                  (unsigned long)windows.count]];
+    if (!found) {
+        [self appendTemplateDebugLog:[NSString stringWithFormat:
+            @"开屏跳过文字无可派发目标 windows=%lu", (unsigned long)windows.count]];
+    }
 }
 
 - (void)startSession {
@@ -1953,10 +1978,9 @@ static BOOL gASWatchActive = NO;
     [self stopPointWatcher];
     if (!self.enabledOn) return;
     self.hasTriggered = NO;
-    [self.failedViews removeAllObjects];
     [self.pointLastTap removeAllObjects];
     [self.pointTappedViews removeAllObjects];
-    self.sessionStart = CFAbsoluteTimeGetCurrent();
+    self.startupScanDeadline = NSProcessInfo.processInfo.systemUptime + kASSessionDuration;
     self.isMonitoring = YES;
 
     [self appendTemplateDebugLog:[NSString stringWithFormat:@"启动节点监听 enabled=%d watchOn=%d customPoints=%lu popupOn=%d",
@@ -1981,9 +2005,10 @@ static BOOL gASWatchActive = NO;
     });
     dispatch_resume(self.scanTimer);
     [self appendTemplateDebugLog:[NSString stringWithFormat:
-                                  @"启动跳过文字扫描 initial=%.1f interval=%.1f",
+                                  @"启动跳过文字扫描 initial=%.1f interval=%.1f duration=%.1f",
                                   kASStartupSkipInitialDelay,
-                                  kASStartupSkipInterval]];
+                                  kASStartupSkipInterval,
+                                  kASSessionDuration]];
     if (self.watchOn && self.customPoints.count > 0) {
         [self wakeWatchBurstWithDuration:kASSessionDuration];
     }
@@ -1992,6 +2017,7 @@ static BOOL gASWatchActive = NO;
 - (void)stopSession {
     // dispatch source 取消后立即置空，下一次会话可以安全创建新的 timer。
     self.isMonitoring = NO;
+    [self.startupRetryTimes removeAllObjects];
     if (self.scanTimer) {
         dispatch_source_cancel(self.scanTimer);
         self.scanTimer = nil;
@@ -2197,6 +2223,10 @@ static BOOL gASWatchActive = NO;
 #pragma mark 点击派发
 
 - (BOOL)activateView:(UIView *)view inWindow:(UIWindow *)window {
+    return [self activateView:view inWindow:window allowLargeTarget:NO];
+}
+
+- (BOOL)activateView:(UIView *)view inWindow:(UIWindow *)window allowLargeTarget:(BOOL)allowLargeTarget {
     // 点击优先级：可用 UIControl action -> UITapGestureRecognizer；
     // 两者都没有时由调用方继续尝试屏幕坐标和合成触摸。
     CGSize windowSize = window.bounds.size;
@@ -2206,12 +2236,21 @@ static BOOL gASWatchActive = NO;
         BOOL oversized = rect.size.width > windowSize.width * 0.6 ||
             rect.size.height > windowSize.height * 0.3;
 
-        if ((!oversized || [current isKindOfClass:[UIControl class]]) &&
-            [current isKindOfClass:[UIControl class]] && ((UIControl *)current).isEnabled) {
-            [(UIControl *)current sendActionsForControlEvents:UIControlEventTouchUpInside];
-            return YES;
+        if ([current isKindOfClass:[UIControl class]]) {
+            UIControl *control = (UIControl *)current;
+            if (control.isEnabled) {
+                UIControlEvents events = control.allControlEvents;
+                if (events & UIControlEventTouchUpInside) {
+                    [control sendActionsForControlEvents:UIControlEventTouchUpInside];
+                    return YES;
+                }
+                if (events & UIControlEventPrimaryActionTriggered) {
+                    [control sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
+                    return YES;
+                }
+            }
         }
-        if (!oversized) {
+        if (!oversized || (allowLargeTarget && current == view)) {
             for (UIGestureRecognizer *gesture in current.gestureRecognizers) {
                 if ([gesture isKindOfClass:[UITapGestureRecognizer class]] && gesture.isEnabled && ASFireTapGesture(gesture)) {
                     return YES;
@@ -2825,6 +2864,20 @@ static BOOL gASWatchActive = NO;
     }
 
     CGPoint screenPoint = self.customPoints[index].CGPointValue;
+    if (signature.count > 0) {
+        ASNodeActivationResult result = [self activateSavedNode:signature
+                                                    screenPoint:screenPoint
+                                                        windows:ASVisibleWindowsInScene(host)
+                                                          index:index
+                                                      automatic:NO];
+        if (result == ASNodeActivated) {
+            [self showToast:@"节点匹配成功，已派发点击" symbol:@"checkmark.circle.fill" inWindow:host];
+        } else {
+            NSString *message = result == ASNodeNotFound ? @"当前页面未匹配到节点" : @"节点已匹配，但点击派发失败";
+            [self showToast:message symbol:@"exclamationmark.circle.fill" inWindow:host];
+        }
+        return;
+    }
     if ([self activateScreenPoint:screenPoint]) {
         [self showTapFeedbackAtPoint:ASViewPointFromScreen(host, screenPoint) inWindow:host];
         [self showToast:@"点击测试成功" symbol:@"checkmark.circle.fill" inWindow:host];
@@ -3481,33 +3534,18 @@ static BOOL gASWatchActive = NO;
     overlay.userInteractionEnabled = YES;
     [root addSubview:overlay];
 
-    NSMutableArray<UIView *> *candidates = [NSMutableArray array];
-    // 录制阶段优先完整收集，避免复杂广告层级在前 160 个候选处被截断。
-    // 预算只限制遍历节点数，不限制候选数量；普通页面通常远低于这个值。
-    NSInteger budget = 24000;
-    [self collectNodeCandidatesFromView:host
-                               inWindow:host
-                                  depth:0
-                                 budget:&budget
-                                results:candidates];
-    // 极端页面可能产生大量候选，保留足够大的安全上限，避免创建过多
-    // 覆盖按钮导致录制层卡顿。排序后优先保留可点击、有文字和更具体的节点。
-    if (candidates.count > 480) {
-        [candidates sortUsingComparator:^NSComparisonResult(UIView *first, UIView *second) {
-            BOOL firstTappable = ASViewIsTappable(first);
-            BOOL secondTappable = ASViewIsTappable(second);
-            if (firstTappable != secondTappable) return firstTappable ? NSOrderedAscending : NSOrderedDescending;
-            BOOL firstHasText = ASTextOfView(first).length > 0 || first.accessibilityLabel.length > 0;
-            BOOL secondHasText = ASTextOfView(second).length > 0 || second.accessibilityLabel.length > 0;
-            if (firstHasText != secondHasText) return firstHasText ? NSOrderedAscending : NSOrderedDescending;
-            CGRect firstRect = [first convertRect:first.bounds toView:host];
-            CGRect secondRect = [second convertRect:second.bounds toView:host];
-            CGFloat firstArea = firstRect.size.width * firstRect.size.height;
-            CGFloat secondArea = secondRect.size.width * secondRect.size.height;
-            return firstArea < secondArea ? NSOrderedAscending : (firstArea > secondArea ? NSOrderedDescending : NSOrderedSame);
-        }];
-        [candidates removeObjectsInRange:NSMakeRange(480, candidates.count - 480)];
+    NSMutableOrderedSet<UIView *> *collectedNodes = [NSMutableOrderedSet orderedSet];
+    // 在同一个界面场景中从前向后扫描，录制独立广告窗口和主窗口。
+    NSArray<UIWindow *> *windows = ASVisibleWindowsInScene(host);
+    NSInteger budget = kASNodeRecordingBudget;
+    for (UIWindow *candidateWindow in windows) {
+        [self collectNodeCandidatesFromView:candidateWindow
+                                   inWindow:candidateWindow
+                                      depth:0
+                                     budget:&budget
+                                    results:collectedNodes];
     }
+    NSMutableArray<UIView *> *candidates = [collectedNodes.array mutableCopy];
     [candidates sortUsingComparator:^NSComparisonResult(UIView *first, UIView *second) {
         BOOL firstTappable = ASViewIsTappable(first);
         BOOL secondTappable = ASViewIsTappable(second);
@@ -3519,55 +3557,63 @@ static BOOL gASWatchActive = NO;
         if (firstHasText != secondHasText) {
             return firstHasText ? NSOrderedAscending : NSOrderedDescending;
         }
-        CGRect firstRect = [first convertRect:first.bounds toView:host];
-        CGRect secondRect = [second convertRect:second.bounds toView:host];
+        CGRect firstRect = [first convertRect:first.bounds toView:first.window];
+        CGRect secondRect = [second convertRect:second.bounds toView:second.window];
         CGFloat firstArea = firstRect.size.width * firstRect.size.height;
         CGFloat secondArea = secondRect.size.width * secondRect.size.height;
-        if (fabs(firstArea - secondArea) > 1.0) {
+        if (firstArea != secondArea) {
             return firstArea < secondArea ? NSOrderedAscending : NSOrderedDescending;
         }
         return NSOrderedSame;
     }];
+    if (candidates.count > 480) {
+        [candidates removeObjectsInRange:NSMakeRange(480, candidates.count - 480)];
+    }
     if (candidates.count == 0) {
         [overlay removeFromSuperview];
         [self showToast:@"当前页面没有可选择的视图节点" symbol:@"viewfinder" inWindow:host];
         [self presentSettingsInWindow:host];
         return;
     }
-    [self appendTemplateDebugLog:[NSString stringWithFormat:
-        @"节点录制扫描 window=%@ candidates=%lu remainingBudget=%ld",
-        NSStringFromClass([host class]),
+    NSMutableString *candidateLog = [NSMutableString stringWithFormat:
+        @"节点录制扫描 windows=%lu candidates=%lu collected=%lu remainingBudget=%ld",
+        (unsigned long)windows.count,
         (unsigned long)candidates.count,
-        (long)budget]];
+        (unsigned long)collectedNodes.count,
+        (long)budget];
     [candidates enumerateObjectsUsingBlock:^(UIView *node, NSUInteger index, BOOL *stop) {
-        CGRect rect = [node convertRect:node.bounds toView:host];
+        CGRect rect = [node convertRect:node.bounds toView:node.window];
         NSString *text = ASTextOfView(node);
         NSString *accessibility = node.accessibilityLabel.length > 0
             ? node.accessibilityLabel : node.accessibilityIdentifier;
-        [self appendTemplateDebugLog:[NSString stringWithFormat:
-            @"节点候选 index=%lu class=%@ text='%@' accessibility='%@' rect=%@ tappable=%@ visualLeaf=%@",
+        [candidateLog appendFormat:
+            @"\n节点候选 index=%lu class=%@ text='%@' accessibility='%@' rect=%@ tappable=%@ visualLeaf=%@",
             (unsigned long)(index + 1),
             NSStringFromClass([node class]),
             text ?: @"",
             accessibility ?: @"",
             NSStringFromCGRect(rect),
             ASViewIsTappable(node) ? @"YES" : @"NO",
-            ASViewLooksLikeVisualLeaf(node) ? @"YES" : @"NO"]];
+            ASViewLooksLikeVisualLeaf(node) ? @"YES" : @"NO"];
     }];
-    self.nodeHostWindow = host;
+    [self appendTemplateDebugLog:candidateLog];
     self.nodeCandidateViews = candidates;
-    self.nodeCandidateButtons = [NSMutableArray array];
 
     UIColor *nodeColor = [UIColor colorWithRed:0.22 green:0.92 blue:0.46 alpha:1.0];
     // 候选数组为了让编号稳定仍按“可点击、文字、小面积”排序，
     // 但绘制时反过来先放大框、再放小框。这样嵌套节点不会被大容器
     // 的半透明按钮盖住，用户点击时也会优先命中更具体的小节点。
     NSArray<UIView *> *drawOrder = [candidates sortedArrayUsingComparator:^NSComparisonResult(UIView *first, UIView *second) {
-        CGRect firstRect = [first convertRect:first.bounds toView:host];
-        CGRect secondRect = [second convertRect:second.bounds toView:host];
+        NSUInteger firstWindow = [windows indexOfObjectIdenticalTo:first.window];
+        NSUInteger secondWindow = [windows indexOfObjectIdenticalTo:second.window];
+        if (firstWindow != secondWindow) {
+            return firstWindow > secondWindow ? NSOrderedAscending : NSOrderedDescending;
+        }
+        CGRect firstRect = [first convertRect:first.bounds toView:first.window];
+        CGRect secondRect = [second convertRect:second.bounds toView:second.window];
         CGFloat firstArea = firstRect.size.width * firstRect.size.height;
         CGFloat secondArea = secondRect.size.width * secondRect.size.height;
-        if (fabs(firstArea - secondArea) > 1.0) {
+        if (firstArea != secondArea) {
             return firstArea > secondArea ? NSOrderedAscending : NSOrderedDescending;
         }
         BOOL firstTappable = ASViewIsTappable(first);
@@ -3580,15 +3626,14 @@ static BOOL gASWatchActive = NO;
     [drawOrder enumerateObjectsUsingBlock:^(UIView *node, NSUInteger drawIndex, BOOL *stop) {
         NSUInteger index = [candidates indexOfObjectIdenticalTo:node];
         if (index == NSNotFound) return;
-        CGRect hostRect = [node convertRect:node.bounds toView:host];
-        CGPoint screenMin = ASScreenPointFromView(host, CGPointMake(CGRectGetMinX(hostRect), CGRectGetMinY(hostRect)));
-        CGPoint screenMax = ASScreenPointFromView(host, CGPointMake(CGRectGetMaxX(hostRect), CGRectGetMaxY(hostRect)));
-        CGPoint hudMin = ASViewPointFromScreen(overlay, screenMin);
-        CGPoint hudMax = ASViewPointFromScreen(overlay, screenMax);
-        CGRect frame = CGRectMake(MIN(hudMin.x, hudMax.x),
-                                  MIN(hudMin.y, hudMax.y),
-                                  fabs(hudMax.x - hudMin.x),
-                                  fabs(hudMax.y - hudMin.y));
+        UIWindow *nodeWindow = node.window;
+        if (!nodeWindow) return;
+        CGRect windowRect = ASVisibleNodeRect(node, nodeWindow, [node convertRect:node.bounds toView:nodeWindow]);
+        if (CGRectIsEmpty(windowRect)) return;
+        id<UICoordinateSpace> screenSpace = ASScreenSpaceForView(nodeWindow);
+        CGRect screenRect = [nodeWindow convertRect:windowRect toCoordinateSpace:screenSpace];
+        CGRect frame = CGRectIntersection([overlay convertRect:screenRect fromCoordinateSpace:screenSpace], overlay.bounds);
+        if (CGRectIsEmpty(frame)) return;
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
         button.frame = frame;
         button.tag = 5000 + (NSInteger)index;
@@ -3602,10 +3647,9 @@ static BOOL gASWatchActive = NO;
         [button setTitle:[NSString stringWithFormat:@"%lu", (unsigned long)(index + 1)]
                 forState:UIControlStateNormal];
         button.accessibilityLabel = [NSString stringWithFormat:@"选择节点 %lu %@", (unsigned long)(index + 1),
-                                     ASSignatureTextOfView(node, host)];
+                                     ASSignatureTextOfView(node, nodeWindow)];
         [button addTarget:self action:@selector(onNodeCandidateTap:) forControlEvents:UIControlEventTouchUpInside];
         [overlay addSubview:button];
-        [self.nodeCandidateButtons addObject:button];
     }];
 
     UIVisualEffectView *card = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterialDark]];
@@ -3663,13 +3707,6 @@ static BOOL gASWatchActive = NO;
     cardPan.cancelsTouchesInView = NO;
     [card addGestureRecognizer:cardPan];
 
-    // 提示卡片不能遮住候选框：广告底部的按钮经常正好落在安全区附近。
-    // 将候选按钮重新置顶，仍保留取消按钮在最上层，保证提示可关闭。
-    for (UIButton *candidateButton in self.nodeCandidateButtons) {
-        [overlay bringSubviewToFront:candidateButton];
-    }
-    [overlay bringSubviewToFront:cancel];
-
     self.pickOverlay = overlay;
     overlay.alpha = 0;
     [UIView animateWithDuration:0.25 animations:^{
@@ -3709,10 +3746,14 @@ static BOOL gASWatchActive = NO;
     NSInteger index = button.tag - 5000;
     if (index < 0 || index >= (NSInteger)self.nodeCandidateViews.count) return;
     UIView *node = self.nodeCandidateViews[(NSUInteger)index];
-    UIWindow *host = self.nodeHostWindow;
+    UIWindow *host = node.window;
     if (!node || !host) return;
 
-    CGRect rect = [node convertRect:node.bounds toView:host];
+    CGRect rect = ASVisibleNodeRect(node, host, [node convertRect:node.bounds toView:host]);
+    if (CGRectIsEmpty(rect)) {
+        [self showToast:@"节点已移出可见区域，请重新录制" symbol:@"exclamationmark.circle.fill" inWindow:host];
+        return;
+    }
     CGPoint point = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
     CGPoint screenPoint = ASScreenPointFromView(host, point);
     NSDictionary *signature = [self signatureForNode:node inWindow:host];
@@ -3732,9 +3773,7 @@ static BOOL gASWatchActive = NO;
 
     UIView *overlay = self.pickOverlay;
     self.pickOverlay = nil;
-    self.nodeHostWindow = nil;
     self.nodeCandidateViews = [NSMutableArray array];
-    self.nodeCandidateButtons = [NSMutableArray array];
     [overlay removeFromSuperview];
 
     [self showTapFeedbackAtPoint:point inWindow:host];
@@ -4249,9 +4288,7 @@ static BOOL gASWatchActive = NO;
     // 取消只移除节点选择层，不修改已保存的项目；随后返回设置面板。
     UIView *overlay = self.pickOverlay;
     self.pickOverlay = nil;
-    self.nodeHostWindow = nil;
     self.nodeCandidateViews = [NSMutableArray array];
-    self.nodeCandidateButtons = [NSMutableArray array];
     [overlay removeFromSuperview];
     UIWindow *host = [self resolveHostWindow:nil];
     [self showToast:@"已取消录制" symbol:@"xmark.circle.fill" inWindow:host];
